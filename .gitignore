@@ -6,3 +6,4 @@ dist/
 *.old.png
 resources/CobraCommander.icns
 resources/CobraShow.icns
+__pycache__/
