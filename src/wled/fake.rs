@@ -2,7 +2,11 @@
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket},
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{Receiver, Sender, channel},
+    },
     time::Duration,
 };
 
@@ -34,6 +38,16 @@ pub struct FakeWled {
     pub udp_port: u16,
     posted: Receiver<(Transport, State)>,
     realtime: UdpSocket,
+    faults: Arc<Faults>,
+}
+
+/// The ways a test can make the fake misbehave.
+#[derive(Default)]
+struct Faults {
+    /// The WebSocket connections currently open.
+    sockets: Mutex<Vec<TcpStream>>,
+    /// How many more requests for the node's info to fail.
+    info_failures: AtomicUsize,
 }
 
 impl FakeWled {
@@ -53,11 +67,14 @@ impl FakeWled {
         let realtime = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let udp_port = realtime.local_addr().unwrap().port();
         let (send, posted) = channel();
+        let faults = Arc::new(Faults::default());
+        let serving_faults = faults.clone();
         // Serves until the test process exits.
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let send = send.clone();
-                std::thread::spawn(move || serve(stream, websocket, udp_port, &send));
+                let faults = serving_faults.clone();
+                std::thread::spawn(move || serve(stream, websocket, udp_port, &send, &faults));
             }
         });
         Self {
@@ -66,7 +83,21 @@ impl FakeWled {
             udp_port,
             posted,
             realtime,
+            faults,
         }
+    }
+
+    /// Drop every open WebSocket without a closing handshake, as a node does
+    /// when it restarts.
+    pub fn drop_websockets(&self) {
+        for socket in self.faults.sockets.lock().unwrap().drain(..) {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// Fail the next `count` requests for the node's info.
+    pub fn fail_info_requests(&self, count: usize) {
+        self.faults.info_failures.store(count, Ordering::SeqCst);
     }
 
     /// The next state posted, failing the test if none arrives.
@@ -91,18 +122,29 @@ impl FakeWled {
 
 /// Serve one connection: a WebSocket for as long as it stays open, or a
 /// single HTTP request.
-fn serve(stream: TcpStream, websocket: bool, udp_port: u16, posted: &Sender<(Transport, State)>) {
+fn serve(
+    stream: TcpStream,
+    websocket: bool,
+    udp_port: u16,
+    posted: &Sender<(Transport, State)>,
+    faults: &Faults,
+) {
     let mut start = [0; 7];
     let peeked = stream.peek(&mut start).unwrap_or(0);
     if websocket && start[..peeked] == *b"GET /ws" {
+        if let Ok(handle) = stream.try_clone() {
+            faults.sockets.lock().unwrap().push(handle);
+        }
         serve_websocket(stream, posted);
     } else {
-        serve_http(stream, udp_port, posted);
+        serve_http(stream, udp_port, posted, faults);
     }
 }
 
 fn serve_websocket(stream: TcpStream, posted: &Sender<(Transport, State)>) {
-    let mut socket = tungstenite::accept(stream).unwrap();
+    let Ok(mut socket) = tungstenite::accept(stream) else {
+        return;
+    };
     // WLED greets every client with its state and info.
     let _ = socket.send(Message::text(r#"{"state":{},"info":{}}"#));
     while let Ok(message) = socket.read() {
@@ -116,7 +158,12 @@ fn serve_websocket(stream: TcpStream, posted: &Sender<(Transport, State)>) {
 }
 
 /// Answer one request, closing the connection afterwards.
-fn serve_http(stream: TcpStream, udp_port: u16, posted: &Sender<(Transport, State)>) {
+fn serve_http(
+    stream: TcpStream,
+    udp_port: u16,
+    posted: &Sender<(Transport, State)>,
+    faults: &Faults,
+) {
     let mut reader = BufReader::new(&stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).unwrap();
@@ -140,6 +187,15 @@ fn serve_http(stream: TcpStream, udp_port: u16, posted: &Sender<(Transport, Stat
         // JSON is a subset of YAML.
         let _ = posted.send((Transport::Http, serde_yaml::from_slice(&body).unwrap()));
         ("200 OK", "{}".to_string())
+    } else if request_line.starts_with("GET /json/info")
+        && faults
+            .info_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+    {
+        ("500 Internal Server Error", String::new())
     } else if request_line.starts_with("GET /json/info") {
         let info =
             format!(r#"{{"ver":"0.15.0","leds":{{"count":{LED_COUNT}}},"udpport":{udp_port}}}"#);

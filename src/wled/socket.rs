@@ -5,7 +5,7 @@
 use std::{
     io,
     net::{TcpStream, ToSocketAddrs},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -22,7 +22,17 @@ const DRAIN_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// An open WebSocket to a WLED node's JSON API.
 #[derive(Debug)]
-pub struct StateSocket(WebSocket<TcpStream>);
+pub struct StateSocket {
+    socket: WebSocket<TcpStream>,
+    /// When we last sent the node anything.
+    sent: Instant,
+}
+
+/// How long a socket may sit quiet before we ping the node.
+const PING_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The most messages from the node to discard in one go.
+const MAX_DRAINED_MESSAGES: usize = 64;
 
 impl StateSocket {
     /// Open the WebSocket of the node whose HTTP API is at `url`.
@@ -44,15 +54,35 @@ impl StateSocket {
         let (socket, _) = tungstenite::client(format!("ws://{host}:{port}/ws"), stream)
             .map_err(|err| anyhow!("WebSocket handshake failed: {err}"))?;
         socket.get_ref().set_read_timeout(Some(DRAIN_TIMEOUT))?;
-        Ok(Self(socket))
+        Ok(Self {
+            socket,
+            sent: Instant::now(),
+        })
     }
 
     /// Send `state` to the node.
     pub fn send(&mut self, state: &State) -> Result<()> {
         let json: String = state.try_into().context("failed to encode the state")?;
-        self.0
+        self.sent = Instant::now();
+        self.socket
             .send(Message::text(json))
             .context("failed to send the state")?;
+        self.drain()
+    }
+
+    /// Look after an idle socket: discard what the node has sent, and ping it
+    /// if we have sent nothing for a while.
+    ///
+    /// A node that restarts leaves no trace on a quiet connection. The ping
+    /// draws a reset out of it, so the loss shows up here rather than on the
+    /// operator's next move.
+    pub fn keep_alive(&mut self) -> Result<()> {
+        if self.sent.elapsed() >= PING_INTERVAL {
+            self.sent = Instant::now();
+            self.socket
+                .send(Message::Ping(Default::default()))
+                .context("failed to ping the node")?;
+        }
         self.drain()
     }
 
@@ -61,9 +91,10 @@ impl StateSocket {
     /// WLED pushes its state to every client whenever it changes. Unread, that
     /// would back up until the node dropped the connection. Fail if the socket
     /// is no longer usable.
-    pub fn drain(&mut self) -> Result<()> {
-        loop {
-            match self.0.read() {
+    fn drain(&mut self) -> Result<()> {
+        // Bounded so that a node sending without pause cannot keep us here.
+        for _ in 0..MAX_DRAINED_MESSAGES {
+            match self.socket.read() {
                 Ok(Message::Close(_)) => bail!("the node closed the WebSocket"),
                 Ok(_) => {}
                 Err(tungstenite::Error::Io(err))
@@ -77,5 +108,6 @@ impl StateSocket {
                 Err(err) => return Err(err).context("the WebSocket failed"),
             }
         }
+        Ok(())
     }
 }

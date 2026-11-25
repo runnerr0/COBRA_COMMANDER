@@ -41,6 +41,9 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long to wait before trying again to open a node's WebSocket.
 const SOCKET_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long to wait before telling a node again what it failed to take.
+const RESEND_INTERVAL: Duration = Duration::from_secs(5);
+
 /// The crossfade WLED applies to each update, in units of 100 ms.
 ///
 /// WLED otherwise fades every change over its configured transition time,
@@ -72,6 +75,12 @@ impl WledController {
     /// Polls once every 5 seconds for initial configuration until the client
     /// responds.
     pub fn run(url: Url) -> Self {
+        Self::run_retrying_every(url, CONNECT_RETRY_INTERVAL)
+    }
+
+    /// As [`Self::run`], waiting `retry_interval` between attempts to reach
+    /// the node.
+    fn run_retrying_every(url: Url, retry_interval: Duration) -> Self {
         let outbox = Arc::new(Outbox::default());
         let flasher = Arc::new(Mutex::new(None));
         let pixels_allowed = Arc::new(AtomicBool::new(true));
@@ -81,22 +90,32 @@ impl WledController {
         let sender_outbox = outbox.clone();
         let sender_url = url.clone();
         crate::worker::spawn("wled-send", move |shutdown| {
-            let Some(mut wled) = initialize(&sender_url, CONNECT_RETRY_INTERVAL, &shutdown) else {
+            let Some(mut wled) = initialize(&sender_url, retry_interval, &shutdown) else {
                 return;
             };
-            match Flasher::connect(&mut wled) {
+            // Until this succeeds the node can neither flash nor have its
+            // pixel ports held, so keep trying while there is nothing to send.
+            let connect_flasher = |wled: &mut Wled, complain: bool| match Flasher::connect(wled) {
                 Ok(connected) => {
-                    if let Ok(mut flasher) = sender_flasher.lock() {
-                        // Apply a choice made before we knew the node's
-                        // address. Read under the lock so a change made now
-                        // is not lost.
-                        let allowed = sender_pixels_allowed.load(Ordering::Acquire);
-                        pixels::hold_pixels(connected.node, !allowed);
-                        *flasher = Some(connected);
-                    }
+                    let Ok(mut flasher) = sender_flasher.lock() else {
+                        return false;
+                    };
+                    // Apply a choice made before we knew the node's
+                    // address. Read under the lock so a change made now
+                    // is not lost.
+                    let allowed = sender_pixels_allowed.load(Ordering::Acquire);
+                    pixels::hold_pixels(connected.node, !allowed);
+                    *flasher = Some(connected);
+                    true
                 }
-                Err(err) => warn!("WLED at {sender_url} will not flash: {err:#}"),
-            }
+                Err(err) if complain => {
+                    warn!("WLED at {sender_url} cannot flash yet, will keep trying: {err:#}");
+                    false
+                }
+                Err(_) => false,
+            };
+            let mut can_flash = connect_flasher(&mut wled, true);
+            let mut flasher_tried = Instant::now();
             let mut link = Link::new(wled);
             loop {
                 match sender_outbox.wait(&shutdown) {
@@ -104,7 +123,13 @@ impl WledController {
                         debug!("Sending WLED state to {sender_url}.");
                         link.send(state);
                     }
-                    Wake::Idle => link.keep_up(),
+                    Wake::Idle => {
+                        link.keep_up();
+                        if !can_flash && flasher_tried.elapsed() >= retry_interval {
+                            can_flash = connect_flasher(&mut link.wled, false);
+                            flasher_tried = Instant::now();
+                        }
+                    }
                     Wake::Stop => break,
                 }
             }
@@ -177,10 +202,11 @@ impl WledController {
 impl Drop for WledController {
     fn drop(&mut self) {
         self.outbox.close();
-        // A fixture that no longer exists must not keep the ports held.
+        // A fixture that no longer exists must not keep the ports held, nor
+        // leave the node lit by a flash it was in the middle of.
         self.with_flasher(|flasher| {
             pixels::hold_pixels(flasher.node, false);
-            Ok(())
+            flasher.end_flash()
         });
     }
 }
@@ -192,6 +218,8 @@ struct Flasher {
     /// The address the node takes realtime data on.
     node: SocketAddr,
     led_count: u16,
+    /// Whether the node is showing a flash of ours.
+    flashing: bool,
 }
 
 impl Flasher {
@@ -216,6 +244,7 @@ impl Flasher {
             realtime,
             node,
             led_count,
+            flashing: false,
         })
     }
 
@@ -226,11 +255,14 @@ impl Flasher {
             return Ok(());
         }
         let white = std::iter::repeat_n([level; 3], usize::from(self.led_count));
+        self.flashing = true;
         self.realtime.show(0, white)
     }
 
+    /// Hand the LEDs back if we lit them. A node we did not flash is left
+    /// alone: something else may be sending it realtime data.
     fn end_flash(&mut self) -> std::io::Result<()> {
-        if pixels::pixels_streaming(self.node) {
+        if !std::mem::take(&mut self.flashing) || pixels::pixels_streaming(self.node) {
             return Ok(());
         }
         self.realtime.release()
@@ -318,6 +350,13 @@ struct Link {
     socket_tried: Option<Instant>,
     /// Whether we have already said that the node has no socket.
     socket_missing: bool,
+    /// Everything the node has been told and should still be showing.
+    told: Option<State>,
+    /// When to tell the node again what it may have missed. None while the
+    /// node is up to date as far as we know.
+    resend_at: Option<Instant>,
+    /// Whether we have already said that the node is not answering.
+    unreachable: bool,
 }
 
 impl Link {
@@ -327,36 +366,92 @@ impl Link {
             socket: None,
             socket_tried: None,
             socket_missing: false,
+            told: None,
+            resend_at: None,
+            unreachable: false,
         }
     }
 
     /// Send `state` over the WebSocket, or over HTTP if there is none.
     fn send(&mut self, state: State) {
+        let told = remember(self.told.take(), &state);
+        // A node that has missed something is brought up to date in one go.
+        let state = if self.resend_at.is_some() {
+            told.clone()
+        } else {
+            state
+        };
+        self.told = Some(told);
+        self.transmit(state);
+    }
+
+    fn transmit(&mut self, mut state: State) {
         self.open_socket();
         if let Some(socket) = &mut self.socket {
             match socket.send(&state) {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.reached();
+                    return;
+                }
                 Err(err) => {
                     warn!("WLED WebSocket to {} failed: {err:#}", self.wled.url);
                     self.socket = None;
+                    // Whatever went into the socket lately may have been lost
+                    // along with it.
+                    if let Some(told) = &self.told {
+                        state = told.clone();
+                    }
                 }
             }
         }
         self.wled.state = Some(state);
-        if let Err(err) = self.wled.flush_state() {
-            warn!("failed to send WLED state update: {err}");
+        match self.wled.flush_state() {
+            Ok(response) if response.status().is_success() => self.reached(),
+            Ok(response) => self.missed(format_args!("the node answered {}", response.status())),
+            Err(err) => self.missed(format_args!("{err}")),
         }
     }
 
-    /// Look after the socket between sends, so that the next state does not
-    /// wait on a connection being opened.
+    /// The node took what we sent.
+    fn reached(&mut self) {
+        if self.unreachable {
+            info!("WLED at {} is answering again.", self.wled.url);
+        }
+        self.unreachable = false;
+        self.resend_at = None;
+    }
+
+    /// The node did not take what we sent; try again later.
+    fn missed(&mut self, why: std::fmt::Arguments) {
+        if self.unreachable {
+            debug!("WLED at {} is still not answering: {why}", self.wled.url);
+        } else {
+            warn!(
+                "failed to send state to WLED at {}, will keep trying: {why}",
+                self.wled.url
+            );
+        }
+        self.unreachable = true;
+        self.resend_at = Some(Instant::now() + RESEND_INTERVAL);
+    }
+
+    /// Look after the connection between sends: keep the socket open so that
+    /// the next state does not wait on it, and bring a node that dropped out
+    /// back to what it should be showing.
     fn keep_up(&mut self) {
         self.open_socket();
         if let Some(socket) = &mut self.socket
-            && let Err(err) = socket.drain()
+            && let Err(err) = socket.keep_alive()
         {
             warn!("WLED WebSocket to {} failed: {err:#}", self.wled.url);
             self.socket = None;
+            self.resend_at = Some(Instant::now());
+        }
+        if self.resend_at.is_some_and(|at| at <= Instant::now()) {
+            match self.told.clone() {
+                Some(told) => self.transmit(told),
+                None => self.resend_at = None,
+            }
         }
     }
 
@@ -422,6 +517,30 @@ fn supersede_seg(newer: &mut Seg, unsent: Seg) {
     newer.ix = newer.ix.or(unsent.ix);
     newer.pal = newer.pal.or(unsent.pal);
     newer.col = newer.col.take().or(unsent.col);
+}
+
+/// Add `state` to what a node has been told, giving what to send a node that
+/// has lost track: one that restarted, or dropped off the network for a while.
+///
+/// A preset brings its own look and picking an effect, palette or colour
+/// replaces the preset's, so whichever came last is the one kept.
+fn remember(told: Option<State>, state: &State) -> State {
+    let sets_look = state
+        .seg
+        .as_ref()
+        .and_then(|segs| segs.first())
+        .is_some_and(|seg| seg.fx.is_some() || seg.pal.is_some() || seg.col.is_some());
+    let mut told = supersede(told, state.clone());
+    if state.ps.is_some() && !sets_look {
+        if let Some(seg) = told.seg.as_mut().and_then(|segs| segs.first_mut()) {
+            seg.fx = None;
+            seg.pal = None;
+            seg.col = None;
+        }
+    } else if sets_look {
+        told.ps = None;
+    }
+    told
 }
 
 /// Poll the WLED API until we get a good config back.
@@ -676,6 +795,118 @@ mod tests {
 
         let state = waiter.join().unwrap().unwrap();
         assert_eq!(state.bri, Some(10));
+    }
+
+    fn look(fx: u16) -> State {
+        State {
+            seg: Some(vec![Seg {
+                fx: Some(fx),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// A node that restarts comes back showing its boot preset. Without being
+    /// asked, the controller tells it again what it should be showing.
+    #[test]
+    fn node_that_drops_its_socket_is_told_everything_again() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        controller.send(WledControlMessage::SetState(look(108)));
+        assert_eq!(fake.next_posted().0, Transport::WebSocket);
+        controller.send(WledControlMessage::SetState(level(20)));
+        assert_eq!(fake.next_state().bri, Some(20));
+
+        // Let the sender finish with that state, so that it is an idle sender
+        // that finds the socket gone.
+        std::thread::sleep(Duration::from_millis(50));
+        fake.drop_websockets();
+
+        let state = fake.next_state();
+        assert_eq!(state.bri, Some(20));
+        assert_eq!(state.seg.unwrap().remove(0).fx, Some(108));
+    }
+
+    /// Picking an effect replaces a preset's look, so a node brought up to
+    /// date must not be sent back to the preset.
+    #[test]
+    fn remembered_preset_gives_way_to_a_newer_look() {
+        let told = remember(Some(preset(3)), &look(108));
+        assert_eq!(told.ps, None);
+        assert_eq!(told.seg.unwrap().remove(0).fx, Some(108));
+    }
+
+    /// Picking a preset replaces the look chosen before it, but not the
+    /// level.
+    #[test]
+    fn remembered_look_gives_way_to_a_newer_preset() {
+        let told = remember(Some(look(108)), &level(20));
+        let told = remember(Some(told), &preset(3));
+        assert_eq!(told.ps, Some(3));
+        assert_eq!(told.bri, Some(20));
+        assert_eq!(told.seg.unwrap().remove(0).fx, None);
+    }
+
+    /// A node that cannot describe itself when first reached learns to flash
+    /// once it can.
+    #[test]
+    fn controller_learns_to_flash_once_the_node_describes_itself() {
+        let fake = FakeWled::start();
+        fake.fail_info_requests(2);
+        let controller =
+            WledController::run_retrying_every(fake.url.clone(), Duration::from_millis(20));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            controller.flash(200);
+            if fake
+                .next_realtime_packet(Duration::from_millis(50))
+                .is_some()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "no flash arrived");
+        }
+    }
+
+    /// A fixture removed in the middle of a flash does not leave its node lit.
+    #[test]
+    fn dropping_the_controller_ends_a_flash() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            controller.flash(200);
+            if fake
+                .next_realtime_packet(Duration::from_millis(50))
+                .is_some()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "no flash arrived");
+        }
+        drop(controller);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.next_realtime_packet(Duration::from_millis(50)) != Some(vec![4, 0]) {
+            assert!(Instant::now() < deadline, "the node was never released");
+        }
+    }
+
+    /// A node we never flashed may be showing someone else's realtime data.
+    #[test]
+    fn ending_a_flash_that_never_started_sends_nothing() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        // Wait for the controller to have heard from the node.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while controller.flasher.lock().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the node was never described");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        controller.end_flash();
+        assert_eq!(fake.next_realtime_packet(Duration::from_millis(100)), None);
     }
 
     #[test]
