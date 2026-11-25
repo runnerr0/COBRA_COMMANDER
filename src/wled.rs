@@ -377,9 +377,11 @@ struct Link {
     /// When to tell the node again what it may have missed. None while the
     /// node is up to date as far as we know.
     resend_at: Option<Instant>,
-    /// When a node that was sent back to its preset will have loaded it and
-    /// can be told the rest.
+    /// When a node that was sent a preset will have loaded it and can be
+    /// told the rest.
     after_preset: Option<Instant>,
+    /// Whether the preset in `told` has yet to reach the node.
+    preset_unsent: bool,
     /// Whether we have already said that the node is not answering.
     unreachable: bool,
     /// When this link was made; the clock boot times are kept on.
@@ -418,6 +420,7 @@ impl Link {
             told: None,
             resend_at: None,
             after_preset: None,
+            preset_unsent: false,
             unreachable: false,
             created: Instant::now(),
             booted: None,
@@ -425,19 +428,31 @@ impl Link {
     }
 
     /// Send `state` over the WebSocket, or over HTTP if there is none.
+    ///
+    /// A preset overrides a level that arrives in the same message, which
+    /// happens when a preset is picked while a fader is moving. The level is
+    /// then sent again once the node has had time to load the preset.
     fn send(&mut self, state: State) {
-        if state.ps.is_some() {
+        let picks_preset = state.ps.is_some();
+        let sets_level = state.on.is_some() || state.bri.is_some();
+        if picks_preset {
             // A newly picked preset replaces one the node was being sent
             // back to.
             self.after_preset = None;
         }
-        self.told = Some(remember(self.told.take(), &state));
+        let told = remember(self.told.take(), &state);
+        self.preset_unsent = picks_preset || (self.preset_unsent && told.ps.is_some());
+        self.told = Some(told);
         if self.resend_at.is_some() {
             // The node has missed something, so bring it fully up to date.
             self.resync();
         } else {
             let sent = self.transmit(state);
             self.note(sent);
+            if picks_preset && sent != Sent::Missed {
+                self.preset_unsent = false;
+                self.after_preset = sets_level.then(|| Instant::now() + PRESET_LOAD_TIME);
+            }
         }
         self.finish_resync();
     }
@@ -464,7 +479,8 @@ impl Link {
     ///
     /// A node that only dropped its connection still has its preset, and
     /// loading it again would show for a moment on stage, so the preset is
-    /// sent only to a node that has restarted. WLED applies the other fields
+    /// sent only to a node that has restarted or has yet to be told of it.
+    /// WLED applies the other fields
     /// of a message before it loads the preset the message names, and the
     /// preset then overrides them, so the preset goes alone and the rest
     /// follows once the node has had time to load it.
@@ -478,7 +494,7 @@ impl Link {
             self.resend_at = Some(Instant::now() + RESEND_INTERVAL);
             return;
         };
-        let (first, follows) = if restarted && told.ps.is_some() {
+        let (first, follows) = if (restarted || self.preset_unsent) && told.ps.is_some() {
             let preset = State {
                 ps: told.ps,
                 tt: told.tt,
@@ -493,6 +509,7 @@ impl Link {
             return;
         }
         self.resend_at = None;
+        self.preset_unsent = false;
         self.after_preset = follows.then(|| Instant::now() + PRESET_LOAD_TIME);
     }
 
@@ -1068,6 +1085,62 @@ mod tests {
         assert_eq!(second.ps, None);
         assert_eq!(second.bri, Some(20));
         assert!(asked_for_preset.elapsed() >= PRESET_LOAD_TIME / 2);
+    }
+
+    /// A preset picked while a fader is moving goes out with the level, and
+    /// overrides it. The level is sent again once the preset has loaded.
+    #[test]
+    fn level_sent_with_a_preset_is_sent_again_afterwards() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        controller.send(WledControlMessage::SetState(State {
+            ps: Some(3),
+            bri: Some(20),
+            ..Default::default()
+        }));
+        assert_eq!(fake.next_state().ps, Some(3));
+        let asked_for_preset = Instant::now();
+
+        let second = fake.next_state();
+        assert_eq!(second.ps, None);
+        assert_eq!(second.bri, Some(20));
+        assert!(asked_for_preset.elapsed() >= PRESET_LOAD_TIME / 2);
+    }
+
+    /// A preset picked on its own leaves the level to the preset.
+    #[test]
+    fn preset_sent_alone_is_not_followed_by_anything() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        controller.send(WledControlMessage::SetState(level(20)));
+        assert_eq!(fake.next_state().bri, Some(20));
+        controller.send(WledControlMessage::SetState(preset(3)));
+        assert_eq!(fake.next_state().ps, Some(3));
+
+        assert!(fake.posted_within(PRESET_LOAD_TIME * 3).is_none());
+    }
+
+    /// A preset picked while a node is out of reach is one the node never
+    /// had. It is sent once the node is back, restarted or not.
+    #[test]
+    fn preset_picked_while_the_node_is_behind_still_reaches_it() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        controller.send(WledControlMessage::SetState(level(20)));
+        assert_eq!(fake.next_state().bri, Some(20));
+
+        // The sender finds the socket gone, cannot learn whether the node
+        // restarted, and puts off telling it again.
+        std::thread::sleep(Duration::from_millis(50));
+        fake.fail_info_requests(1);
+        fake.drop_websockets();
+        std::thread::sleep(Duration::from_millis(500));
+
+        controller.send(WledControlMessage::SetState(preset(3)));
+        let first = fake.next_state();
+        assert_eq!(first.ps, Some(3));
+        assert_eq!(first.bri, None);
+        assert_eq!(fake.next_state().bri, Some(20));
     }
 
     /// A node that only dropped its connection still has its preset. Loading
