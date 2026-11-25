@@ -8,6 +8,7 @@ use std::{
     fmt, io,
     net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
     sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -153,6 +154,18 @@ fn unclaim(node: SocketAddr) {
 /// releasing it.
 const PORT_TIMEOUT_SECS: u8 = 2;
 
+/// How long a port must go without a failed send before it reports one again.
+const FAILURE_QUIET_PERIOD: Duration = Duration::from_secs(10);
+
+/// Note a failed send at `now`, returning whether it is the first in a while
+/// and so worth reporting.
+fn first_of_a_run(failed: &mut Option<Instant>, now: Instant) -> bool {
+    let recently =
+        failed.is_some_and(|failed| now.saturating_duration_since(failed) < FAILURE_QUIET_PERIOD);
+    *failed = Some(now);
+    !recently
+}
+
 fn one_led_per_pixel() -> u16 {
     1
 }
@@ -177,6 +190,9 @@ pub struct WledPixelPort {
     /// Whether the node is showing our pixels, as far as we know.
     #[serde(skip)]
     showing: bool,
+    /// When a send to the node last failed.
+    #[serde(skip)]
+    failed: Option<Instant>,
 }
 
 impl WledPixelPort {
@@ -199,6 +215,7 @@ impl WledPixelPort {
                 leds_per_pixel,
                 realtime: None,
                 showing: false,
+                failed: None,
             })
             .collect()
     }
@@ -272,10 +289,21 @@ impl DmxPort for WledPixelPort {
             .chain(std::iter::repeat([0; 3]))
             .flat_map(|pixel| std::iter::repeat_n(pixel, usize::from(self.leds_per_pixel)))
             .take(usize::from(self.led_count));
-        realtime
-            .show(self.first_led, pixels)
-            .context("failed to send pixels to WLED")?;
-        Ok(())
+        let Err(err) = realtime.show(self.first_led, pixels) else {
+            return Ok(());
+        };
+        // A node that is switched off fails every frame, or every other one.
+        // The show goes on either way, so say so once rather than forty
+        // times a second.
+        if !first_of_a_run(&mut self.failed, Instant::now()) {
+            return Ok(());
+        }
+        Err(anyhow::Error::new(err)
+            .context(format!(
+                "failed to send pixels to WLED node {} at {}; still trying",
+                self.name, self.address
+            ))
+            .into())
     }
 }
 
@@ -287,8 +315,6 @@ impl Drop for WledPixelPort {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use crate::wled::discovery::DEFAULT_UDP_PORT;
 
@@ -463,6 +489,45 @@ mod tests {
         assert!(matches!(
             ports[0].write(&[1, 2, 3]),
             Err(WriteError::Disconnected)
+        ));
+    }
+
+    /// A node that is not there refuses every packet. The port reports that
+    /// once, not on every frame.
+    #[test]
+    fn unreachable_node_is_reported_once() {
+        let (socket, node) = listening_node(Some(1));
+        drop(socket);
+        let mut port = WledPixelPort::for_node(&node, 1).remove(0);
+        port.open().unwrap();
+
+        let mut failures = 0;
+        for _ in 0..20 {
+            if port.write(&[1, 2, 3]).is_err() {
+                failures += 1;
+            }
+            // Give the refusal time to come back.
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(failures, 1);
+    }
+
+    /// Failures that keep coming are reported once; one that follows a long
+    /// enough spell of good sends is reported afresh.
+    #[test]
+    fn only_the_first_failure_of_a_run_is_reported() {
+        let start = Instant::now();
+        let mut failed = None;
+        assert!(first_of_a_run(&mut failed, start));
+        assert!(!first_of_a_run(&mut failed, start + Duration::from_secs(1)));
+        // Still within the quiet period of the failure before it.
+        assert!(!first_of_a_run(
+            &mut failed,
+            start + FAILURE_QUIET_PERIOD + Duration::from_millis(500)
+        ));
+        assert!(first_of_a_run(
+            &mut failed,
+            start + FAILURE_QUIET_PERIOD * 3
         ));
     }
 
