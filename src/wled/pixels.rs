@@ -216,8 +216,10 @@ impl fmt::Display for WledPixelPort {
             "WLED {} at {} LEDs {}-{}",
             self.name,
             self.address,
-            self.first_led + 1,
-            self.first_led + self.led_count,
+            // A hand-edited show file can hold a run that ends past the last
+            // index a u16 can name.
+            u32::from(self.first_led) + 1,
+            u32::from(self.first_led) + u32::from(self.led_count),
         )?;
         if self.leds_per_pixel > 1 {
             write!(f, ", {} per pixel", self.leds_per_pixel)?;
@@ -266,7 +268,7 @@ impl DmxPort for WledPixelPort {
         // A frame shorter than the universe leaves the remaining LEDs black.
         let pixels = frame
             .chunks_exact(3)
-            .map(|rgb| [rgb[0], rgb[1], rgb[2]])
+            .filter_map(|rgb| Pixel::try_from(rgb).ok())
             .chain(std::iter::repeat([0; 3]))
             .flat_map(|pixel| std::iter::repeat_n(pixel, usize::from(self.leds_per_pixel)))
             .take(usize::from(self.led_count));
@@ -462,6 +464,17 @@ mod tests {
             ports[0].write(&[1, 2, 3]),
             Err(WriteError::Disconnected)
         ));
+    }
+
+    /// A show file edited by hand can name a run that ends past the last LED
+    /// index; describing such a port must not overflow.
+    #[test]
+    fn port_at_the_end_of_the_index_range_can_be_displayed() {
+        let port: WledPixelPort = serde_yaml::from_str(
+            "{name: far, address: 10.0.0.7, udp_port: 21324, first_led: 65535, led_count: 65535}",
+        )
+        .unwrap();
+        assert_eq!(port.to_string(), "WLED far at 10.0.0.7 LEDs 65536-131070");
     }
 
     /// A port saved in a show file comes back closed and reopens.
