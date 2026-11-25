@@ -54,6 +54,7 @@ zip = "2"
 base64 = "0.22"
 rfd = "0.15"
 uuid = { version = "1", features = ["v4", "serde"] }
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"

@@ -1,4 +1,7 @@
 //! Use a thread to perform asynchronous communication with a WLED instance.
+//!
+//! State goes to the node over a WebSocket where the node has one, and over
+//! HTTP otherwise.
 use log::{debug, error, info, warn};
 use std::{
     net::SocketAddr,
@@ -6,7 +9,7 @@ use std::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -18,17 +21,22 @@ use wled_json_api_library::{structures::state::State, wled::Wled};
 use crate::worker::Shutdown;
 use discovery::DEFAULT_UDP_PORT;
 use pixels::Realtime;
+use socket::StateSocket;
 
 pub mod discovery;
 #[cfg(test)]
 pub mod fake;
 pub mod pixels;
+mod socket;
 
 /// How long to wait between attempts to reach a WLED instance at startup.
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often an idle sender re-checks for shutdown.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long to wait before trying again to open a node's WebSocket.
+const SOCKET_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The crossfade WLED applies to each update, in units of 100 ms.
 ///
@@ -86,11 +94,15 @@ impl WledController {
                 }
                 Err(err) => warn!("WLED at {sender_url} will not flash: {err:#}"),
             }
-            while let Some(state) = sender_outbox.take(&shutdown) {
-                wled.state = Some(state);
-                debug!("Sending WLED state to {sender_url}.");
-                if let Err(err) = wled.flush_state() {
-                    warn!("failed to send WLED state update: {err}");
+            let mut link = Link::new(wled);
+            loop {
+                match sender_outbox.wait(&shutdown) {
+                    Wake::State(state) => {
+                        debug!("Sending WLED state to {sender_url}.");
+                        link.send(state);
+                    }
+                    Wake::Idle => link.keep_up(),
+                    Wake::Stop => break,
                 }
             }
             info!("WLED sender thread for {sender_url} shutting down.");
@@ -261,22 +273,113 @@ impl Outbox {
         self.wake.notify_one();
     }
 
-    /// Block until a state is posted and take it.
-    ///
-    /// Return None once the outbox is closed or shutdown is triggered.
-    fn take(&self, shutdown: &Shutdown) -> Option<State> {
-        let mut pending = self.pending.lock().ok()?;
-        loop {
-            if pending.closed || shutdown.triggered() {
-                return None;
+    /// Wait a short while for a state to be posted, and take it.
+    fn wait(&self, shutdown: &Shutdown) -> Wake {
+        let Ok(pending) = self.pending.lock() else {
+            return Wake::Stop;
+        };
+        let Ok((mut pending, _)) =
+            self.wake
+                .wait_timeout_while(pending, SHUTDOWN_POLL_INTERVAL, |pending| {
+                    pending.state.is_none() && !pending.closed
+                })
+        else {
+            return Wake::Stop;
+        };
+        if pending.closed || shutdown.triggered() {
+            return Wake::Stop;
+        }
+        match pending.state.take() {
+            Some(state) => Wake::State(state),
+            None => Wake::Idle,
+        }
+    }
+}
+
+/// Why a sender stopped waiting on its [`Outbox`].
+enum Wake {
+    /// A state is ready to send.
+    State(State),
+    /// Nothing was posted; a chance to look after the connection.
+    Idle,
+    /// The outbox is closed or the app is shutting down.
+    Stop,
+}
+
+/// The connection state is sent over.
+struct Link {
+    wled: Wled,
+    socket: Option<StateSocket>,
+    /// When we last tried to open the socket, so that a node without one is
+    /// not asked again on every send.
+    socket_tried: Option<Instant>,
+    /// Whether we have already said that the node has no socket.
+    socket_missing: bool,
+}
+
+impl Link {
+    fn new(wled: Wled) -> Self {
+        Self {
+            wled,
+            socket: None,
+            socket_tried: None,
+            socket_missing: false,
+        }
+    }
+
+    /// Send `state` over the WebSocket, or over HTTP if there is none.
+    fn send(&mut self, state: State) {
+        self.open_socket();
+        if let Some(socket) = &mut self.socket {
+            match socket.send(&state) {
+                Ok(()) => return,
+                Err(err) => {
+                    warn!("WLED WebSocket to {} failed: {err:#}", self.wled.url);
+                    self.socket = None;
+                }
             }
-            if let Some(state) = pending.state.take() {
-                return Some(state);
+        }
+        self.wled.state = Some(state);
+        if let Err(err) = self.wled.flush_state() {
+            warn!("failed to send WLED state update: {err}");
+        }
+    }
+
+    /// Look after the socket between sends, so that the next state does not
+    /// wait on a connection being opened.
+    fn keep_up(&mut self) {
+        self.open_socket();
+        if let Some(socket) = &mut self.socket
+            && let Err(err) = socket.drain()
+        {
+            warn!("WLED WebSocket to {} failed: {err:#}", self.wled.url);
+            self.socket = None;
+        }
+    }
+
+    fn open_socket(&mut self) {
+        if self.socket.is_some()
+            || self
+                .socket_tried
+                .is_some_and(|tried| tried.elapsed() < SOCKET_RETRY_INTERVAL)
+        {
+            return;
+        }
+        self.socket_tried = Some(Instant::now());
+        match StateSocket::connect(&self.wled.url) {
+            Ok(socket) => {
+                info!("WLED WebSocket to {} is open.", self.wled.url);
+                self.socket = Some(socket);
+                self.socket_missing = false;
             }
-            (pending, _) = self
-                .wake
-                .wait_timeout(pending, SHUTDOWN_POLL_INTERVAL)
-                .ok()?;
+            Err(err) if !self.socket_missing => {
+                info!(
+                    "WLED at {} has no WebSocket, using HTTP: {err:#}",
+                    self.wled.url
+                );
+                self.socket_missing = true;
+            }
+            Err(_) => {}
         }
     }
 }
@@ -330,7 +433,7 @@ mod tests {
 
     use super::{
         discovery::WledNode,
-        fake::{self, FakeWled},
+        fake::{self, FakeWled, Transport},
         pixels::WledPixelPort,
         *,
     };
@@ -407,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn controller_posts_state_without_a_transition() {
+    fn controller_sends_state_without_a_transition() {
         let fake = FakeWled::start();
         let controller = WledController::run(fake.url.clone());
         controller.send(WledControlMessage::SetState(level(10)));
@@ -415,6 +518,42 @@ mod tests {
         let state = fake.next_state();
         assert_eq!(state.bri, Some(10));
         assert_eq!(state.tt, Some(TRANSITION));
+    }
+
+    #[test]
+    fn controller_sends_state_over_the_websocket() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        controller.send(WledControlMessage::SetState(level(10)));
+        assert_eq!(fake.next_posted().0, Transport::WebSocket);
+
+        // The socket stays open for the states that follow.
+        controller.send(WledControlMessage::SetState(level(20)));
+        let (transport, state) = fake.next_posted();
+        assert_eq!(transport, Transport::WebSocket);
+        assert_eq!(state.bri, Some(20));
+    }
+
+    #[test]
+    fn controller_falls_back_to_http_without_a_websocket() {
+        let fake = FakeWled::start_without_websocket();
+        let controller = WledController::run(fake.url.clone());
+        controller.send(WledControlMessage::SetState(level(10)));
+
+        let (transport, state) = fake.next_posted();
+        assert_eq!(transport, Transport::Http);
+        assert_eq!(state.bri, Some(10));
+    }
+
+    /// Wait for the next state, or None once the outbox stops.
+    fn take(outbox: &Outbox) -> Option<State> {
+        loop {
+            match outbox.wait(&Shutdown::default()) {
+                Wake::State(state) => return Some(state),
+                Wake::Idle => {}
+                Wake::Stop => return None,
+            }
+        }
     }
 
     fn level(bri: u8) -> State {
@@ -437,7 +576,7 @@ mod tests {
         assert!(outbox.post(level(10)));
         assert!(outbox.post(level(20)));
 
-        let state = outbox.take(&Shutdown::default()).unwrap();
+        let state = take(&outbox).unwrap();
         assert_eq!(state.bri, Some(20));
     }
 
@@ -448,7 +587,7 @@ mod tests {
         assert!(outbox.post(preset(3)));
         assert!(outbox.post(level(20)));
 
-        let state = outbox.take(&Shutdown::default()).unwrap();
+        let state = take(&outbox).unwrap();
         assert_eq!(state.ps, Some(3));
         assert_eq!(state.bri, Some(20));
     }
@@ -470,12 +609,11 @@ mod tests {
     #[test]
     fn sent_preset_is_not_repeated() {
         let outbox = Outbox::default();
-        let shutdown = Shutdown::default();
         assert!(outbox.post(preset(3)));
-        assert_eq!(outbox.take(&shutdown).unwrap().ps, Some(3));
+        assert_eq!(take(&outbox).unwrap().ps, Some(3));
 
         assert!(outbox.post(level(20)));
-        assert_eq!(outbox.take(&shutdown).unwrap().ps, None);
+        assert_eq!(take(&outbox).unwrap().ps, None);
     }
 
     #[test]
@@ -483,7 +621,7 @@ mod tests {
         let outbox = Arc::new(Outbox::default());
         let waiter = {
             let outbox = outbox.clone();
-            std::thread::spawn(move || outbox.take(&Shutdown::default()))
+            std::thread::spawn(move || take(&outbox))
         };
         assert!(outbox.post(level(10)));
 
@@ -497,6 +635,6 @@ mod tests {
         assert!(outbox.post(level(10)));
         outbox.close();
 
-        assert!(outbox.take(&Shutdown::default()).is_none());
+        assert!(take(&outbox).is_none());
     }
 }
