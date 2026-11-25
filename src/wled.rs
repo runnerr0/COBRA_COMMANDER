@@ -1,7 +1,11 @@
 //! Use a thread to perform asynchronous communication with a WLED instance.
 use log::{debug, error, info, warn};
 use std::{
-    sync::{Arc, Condvar, Mutex},
+    net::SocketAddr,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -47,6 +51,8 @@ pub struct WledController {
     /// Set by the sender once the node has told us how to light its LEDs
     /// directly; until then the node cannot flash.
     flasher: Arc<Mutex<Option<Flasher>>>,
+    /// Whether pixel ports may drive this node; see [`Self::allow_pixels`].
+    pixels_allowed: Arc<AtomicBool>,
 }
 
 impl WledController {
@@ -57,7 +63,9 @@ impl WledController {
     pub fn run(url: Url) -> Self {
         let outbox = Arc::new(Outbox::default());
         let flasher = Arc::new(Mutex::new(None));
+        let pixels_allowed = Arc::new(AtomicBool::new(true));
 
+        let sender_pixels_allowed = pixels_allowed.clone();
         let sender_flasher = flasher.clone();
         let sender_outbox = outbox.clone();
         let sender_url = url.clone();
@@ -68,6 +76,11 @@ impl WledController {
             match Flasher::connect(&mut wled) {
                 Ok(connected) => {
                     if let Ok(mut flasher) = sender_flasher.lock() {
+                        // Apply a choice made before we knew the node's
+                        // address. Read under the lock so a change made now
+                        // is not lost.
+                        let allowed = sender_pixels_allowed.load(Ordering::Acquire);
+                        pixels::hold_pixels(connected.node, !allowed);
                         *flasher = Some(connected);
                     }
                 }
@@ -87,7 +100,18 @@ impl WledController {
             url,
             outbox,
             flasher,
+            pixels_allowed,
         }
+    }
+
+    /// Let pixel ports drive this node, or make them stand down so the node
+    /// shows its own effect.
+    pub fn allow_pixels(&self, allowed: bool) {
+        self.pixels_allowed.store(allowed, Ordering::Release);
+        self.with_flasher(|flasher| {
+            pixels::hold_pixels(flasher.node, !allowed);
+            Ok(())
+        });
     }
 
     /// Light every LED white at `level`, over whatever the node is showing.
@@ -100,7 +124,7 @@ impl WledController {
 
     /// Return the node to what it was showing before a flash.
     pub fn end_flash(&self) {
-        self.with_flasher(|flasher| flasher.realtime.release());
+        self.with_flasher(Flasher::end_flash);
     }
 
     fn with_flasher(&self, action: impl FnOnce(&mut Flasher) -> std::io::Result<()>) {
@@ -138,6 +162,11 @@ impl WledController {
 impl Drop for WledController {
     fn drop(&mut self) {
         self.outbox.close();
+        // A fixture that no longer exists must not keep the ports held.
+        self.with_flasher(|flasher| {
+            pixels::hold_pixels(flasher.node, false);
+            Ok(())
+        });
     }
 }
 
@@ -145,6 +174,8 @@ impl Drop for WledController {
 #[derive(Debug)]
 struct Flasher {
     realtime: Realtime,
+    /// The address the node takes realtime data on.
+    node: SocketAddr,
     led_count: u16,
 }
 
@@ -163,15 +194,31 @@ impl Flasher {
         let udp_port = info.udpport.unwrap_or(DEFAULT_UDP_PORT);
         let realtime = Realtime::connect((host, udp_port), FLASH_TIMEOUT_SECS)
             .context("failed to open a UDP socket to the node")?;
+        let node = realtime
+            .node()
+            .context("failed to resolve the node's address")?;
         Ok(Self {
             realtime,
+            node,
             led_count,
         })
     }
 
+    /// A pixel port repaints the node every frame, so a flash sent alongside
+    /// would only fight it; pixel fixtures flash for themselves.
     fn flash(&mut self, level: u8) -> std::io::Result<()> {
+        if pixels::pixels_streaming(self.node) {
+            return Ok(());
+        }
         let white = std::iter::repeat_n([level; 3], usize::from(self.led_count));
         self.realtime.show(0, white)
+    }
+
+    fn end_flash(&mut self) -> std::io::Result<()> {
+        if pixels::pixels_streaming(self.node) {
+            return Ok(());
+        }
+        self.realtime.release()
     }
 }
 
@@ -279,8 +326,12 @@ pub enum WledControlMessage {
 
 #[cfg(test)]
 mod tests {
+    use rust_dmx::DmxPort;
+
     use super::{
+        discovery::WledNode,
         fake::{self, FakeWled},
+        pixels::WledPixelPort,
         *,
     };
 
@@ -313,6 +364,45 @@ mod tests {
         assert_eq!(
             fake.next_realtime_packet(Duration::from_secs(5)),
             Some(vec![4, 0])
+        );
+    }
+
+    /// Disallowing pixels makes the node's pixel port let go, even when the
+    /// choice is made before the controller has heard from the node.
+    #[test]
+    fn disallowing_pixels_holds_the_nodes_port() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        controller.allow_pixels(false);
+
+        let node = WledNode {
+            name: "fake".to_string(),
+            address: std::net::Ipv4Addr::LOCALHOST,
+            port: fake.port,
+            udp_port: fake.udp_port,
+            led_count: Some(1),
+        };
+        let mut port = WledPixelPort::for_node(&node, 1).remove(0);
+        port.open().unwrap();
+
+        // The port streams until the controller learns the node's address,
+        // then releases the node.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            port.write(&[1, 2, 3]).unwrap();
+            if fake.next_realtime_packet(Duration::from_millis(50)) == Some(vec![4, 0]) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "port never let go");
+        }
+        port.write(&[1, 2, 3]).unwrap();
+        assert_eq!(fake.next_realtime_packet(Duration::from_millis(50)), None);
+
+        controller.allow_pixels(true);
+        port.write(&[1, 2, 3]).unwrap();
+        assert_eq!(
+            fake.next_realtime_packet(Duration::from_secs(5)),
+            Some(vec![4, 2, 0, 0, 1, 2, 3])
         );
     }
 

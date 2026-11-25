@@ -4,8 +4,10 @@
 //! place of its own effect for as long as it keeps arriving, so nothing on the
 //! node needs to be reconfigured.
 use std::{
+    collections::HashSet,
     fmt, io,
-    net::{Ipv4Addr, ToSocketAddrs, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
+    sync::{Mutex, OnceLock},
 };
 
 use anyhow::Context;
@@ -51,6 +53,11 @@ impl Realtime {
         })
     }
 
+    /// The address of the node.
+    pub fn node(&self) -> io::Result<SocketAddr> {
+        self.socket.peer_addr()
+    }
+
     /// Show `pixels` on consecutive LEDs, starting from `first_led`.
     pub fn show(
         &mut self,
@@ -81,6 +88,67 @@ impl Realtime {
     }
 }
 
+/// What pixel ports and WLED fixtures need to know of each other.
+///
+/// A port belongs to a universe and a fixture to the patch, so neither can
+/// reach the other directly; they meet here, by the address a node takes
+/// realtime data on.
+#[derive(Default)]
+struct Nodes {
+    /// Nodes whose fixture has asked pixel ports to stand down.
+    held: HashSet<SocketAddr>,
+    /// Nodes a pixel port is currently sending to.
+    streaming: HashSet<SocketAddr>,
+}
+
+static NODES: OnceLock<Mutex<Nodes>> = OnceLock::new();
+
+fn nodes() -> &'static Mutex<Nodes> {
+    NODES.get_or_init(Mutex::default)
+}
+
+/// Ask the pixel ports of `node` to stand down, or let them resume.
+///
+/// While held, a port sends nothing and the node shows its own effect.
+pub fn hold_pixels(node: SocketAddr, hold: bool) {
+    let Ok(mut nodes) = nodes().lock() else {
+        return;
+    };
+    if hold {
+        nodes.held.insert(node);
+    } else {
+        nodes.held.remove(&node);
+    }
+}
+
+/// Whether a pixel port is currently sending to `node`.
+pub fn pixels_streaming(node: SocketAddr) -> bool {
+    nodes()
+        .lock()
+        .is_ok_and(|nodes| nodes.streaming.contains(&node))
+}
+
+/// Record that a port wants to send to `node`, returning whether it may.
+fn claim(node: SocketAddr) -> bool {
+    let Ok(mut nodes) = nodes().lock() else {
+        return true;
+    };
+    if nodes.held.contains(&node) {
+        nodes.streaming.remove(&node);
+        false
+    } else {
+        nodes.streaming.insert(node);
+        true
+    }
+}
+
+/// Record that no port is sending to `node` any longer.
+fn unclaim(node: SocketAddr) {
+    if let Ok(mut nodes) = nodes().lock() {
+        nodes.streaming.remove(&node);
+    }
+}
+
 /// Seconds a node holds a port's last frame if the port stops without
 /// releasing it.
 const PORT_TIMEOUT_SECS: u8 = 2;
@@ -106,6 +174,9 @@ pub struct WledPixelPort {
     leds_per_pixel: u16,
     #[serde(skip)]
     realtime: Option<Realtime>,
+    /// Whether the node is showing our pixels, as far as we know.
+    #[serde(skip)]
+    showing: bool,
 }
 
 impl WledPixelPort {
@@ -127,8 +198,14 @@ impl WledPixelPort {
                 led_count: (total - first_led).min(leds_per_universe),
                 leds_per_pixel,
                 realtime: None,
+                showing: false,
             })
             .collect()
+    }
+
+    /// The address the node takes realtime data on.
+    fn node(&self) -> SocketAddr {
+        (self.address, self.udp_port).into()
     }
 }
 
@@ -164,13 +241,28 @@ impl DmxPort for WledPixelPort {
     fn close(&mut self) {
         if let Some(realtime) = self.realtime.take() {
             let _ = realtime.release();
+            self.showing = false;
+            unclaim(self.node());
         }
     }
 
     fn write(&mut self, frame: &[u8]) -> Result<(), WriteError> {
+        let node = self.node();
         let Some(realtime) = &mut self.realtime else {
             return Err(WriteError::Disconnected);
         };
+        if !claim(node) {
+            // The node's fixture wants its own effect shown: let go once,
+            // then stay quiet.
+            if self.showing {
+                self.showing = false;
+                realtime
+                    .release()
+                    .context("failed to release the WLED node")?;
+            }
+            return Ok(());
+        }
+        self.showing = true;
         // A frame shorter than the universe leaves the remaining LEDs black.
         let pixels = frame
             .chunks_exact(3)
@@ -337,6 +429,28 @@ mod tests {
         port.close();
 
         assert_eq!(receive(&socket), RELEASE);
+    }
+
+    #[test]
+    fn held_port_releases_the_node_once_then_stays_quiet() {
+        let (socket, node) = listening_node(Some(1));
+        let mut ports = WledPixelPort::for_node(&node, 1);
+        let port = &mut ports[0];
+        port.open().unwrap();
+        port.write(&[1, 2, 3]).unwrap();
+        assert_eq!(receive(&socket), [4, 2, 0, 0, 1, 2, 3]);
+        assert!(pixels_streaming(port.node()));
+
+        hold_pixels(port.node(), true);
+        port.write(&[1, 2, 3]).unwrap();
+        port.write(&[1, 2, 3]).unwrap();
+        assert_eq!(receive(&socket), RELEASE);
+        assert!(!pixels_streaming(port.node()));
+
+        // Had the second held write sent anything, it would arrive before this.
+        hold_pixels(port.node(), false);
+        port.write(&[4, 5, 6]).unwrap();
+        assert_eq!(receive(&socket), [4, 2, 0, 0, 4, 5, 6]);
     }
 
     #[test]

@@ -22,6 +22,10 @@ pub struct Wled {
     size: ChannelKnobUnipolar<Unipolar<()>>,
     #[on_change = "update_preset"]
     preset: IndexedSelect<()>,
+    /// Let pixel ports drive this node. When off they stand down and the node
+    /// shows its own effect.
+    #[on_change = "update_pixels"]
+    pixels: Bool<()>,
     #[skip_control]
     #[skip_emit]
     controller: WledController,
@@ -57,6 +61,7 @@ impl PatchFixture for Wled {
                 false,
                 (),
             ),
+            pixels: Bool::new_on("Pixels", ()),
             controller: WledController::run(options.url.0),
             flash: FlashState::new(FLASH_RESPONSE),
         }
@@ -143,6 +148,10 @@ impl Wled {
         self.set_speed(&mut state);
         self.set_size(&mut state);
         self.controller.send(WledControlMessage::SetState(state));
+    }
+
+    fn update_pixels(&self, _emitter: &FixtureStateEmitter) {
+        self.controller.allow_pixels(self.pixels.val());
     }
 
     fn update_preset(&self, _emitter: &FixtureStateEmitter) {
