@@ -1,14 +1,15 @@
 //! Control profile for WLED via http/json API.
 
-use std::num::NonZeroU8;
+use std::{num::NonZeroU8, time::Duration};
 
 use crate::{
     fixture::prelude::*,
+    strobe::FlashState,
     wled::{WledControlMessage, WledController, WledUrl},
 };
 use wled_json_api_library::structures::state::{Seg, State};
 
-#[derive(Debug, EmitState, Control, DescribeControls, Update)]
+#[derive(Debug, EmitState, Control, DescribeControls)]
 pub struct Wled {
     #[channel_control]
     #[on_change = "update_level"]
@@ -24,6 +25,13 @@ pub struct Wled {
     #[skip_control]
     #[skip_emit]
     controller: WledController,
+    /// The flash in progress when the group is strobing.
+    ///
+    /// A WLED fixture has no DMX channels, so the group never renders it and
+    /// it has to time its own flashes.
+    #[skip_control]
+    #[skip_emit]
+    flash: FlashState,
 }
 
 #[derive(Deserialize, OptionsMenu)]
@@ -50,7 +58,12 @@ impl PatchFixture for Wled {
                 (),
             ),
             controller: WledController::run(options.url.0),
+            flash: FlashState::new(FLASH_RESPONSE),
         }
+    }
+
+    fn can_strobe() -> Option<StrobeResponse> {
+        Some(FLASH_RESPONSE)
     }
 
     fn new_patch(_: Self::GroupOptions, _: Self::PatchOptions) -> PatchConfig {
@@ -63,6 +76,27 @@ impl PatchFixture for Wled {
 
 register_patcher!(Wled);
 register_touchosc_template!(Wled);
+
+/// A flash has to cross the network before it shows, so hold it long enough
+/// to survive a late or lost packet.
+const FLASH_RESPONSE: StrobeResponse = StrobeResponse::Long;
+
+impl Update for Wled {
+    fn update(&mut self, update: FixtureGroupUpdate, _dt: Duration) {
+        let was_on = self.flash.is_on();
+        if update.flash_now {
+            self.flash.flash_now();
+        } else {
+            self.flash.update(1);
+        }
+        if self.flash.is_on() {
+            let level = unipolar_to_range(0, 255, update.master_controls.strobe().intensity());
+            self.controller.flash(level);
+        } else if was_on {
+            self.controller.end_flash();
+        }
+    }
+}
 
 impl NonAnimatedFixture for Wled {
     fn render(&self, _: &FixtureGroupControls, _: &mut [u8]) {}

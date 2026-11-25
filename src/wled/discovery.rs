@@ -287,7 +287,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert_eq!(node.port, fake.port);
-        assert_eq!(node.udp_port, fake::UDP_PORT);
+        assert_eq!(node.udp_port, fake.udp_port);
         assert_eq!(node.led_count, Some(fake::LED_COUNT));
 
         advertiser.shutdown().unwrap();

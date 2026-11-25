@@ -5,11 +5,15 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{Context, Result};
+
 use reqwest::Url;
 use serde::Deserialize;
 use wled_json_api_library::{structures::state::State, wled::Wled};
 
 use crate::worker::Shutdown;
+use discovery::DEFAULT_UDP_PORT;
+use pixels::Realtime;
 
 pub mod discovery;
 #[cfg(test)]
@@ -28,6 +32,9 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// which makes a live control lag behind the hand moving it.
 const TRANSITION: u8 = 0;
 
+/// Seconds a node stays lit if the end of a flash never reaches it.
+const FLASH_TIMEOUT_SECS: u8 = 1;
+
 /// The URL of a WLED node's HTTP API.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
@@ -37,6 +44,9 @@ pub struct WledUrl(pub Url);
 pub struct WledController {
     url: Url,
     outbox: Arc<Outbox>,
+    /// Set by the sender once the node has told us how to light its LEDs
+    /// directly; until then the node cannot flash.
+    flasher: Arc<Mutex<Option<Flasher>>>,
 }
 
 impl WledController {
@@ -46,13 +56,23 @@ impl WledController {
     /// responds.
     pub fn run(url: Url) -> Self {
         let outbox = Arc::new(Outbox::default());
+        let flasher = Arc::new(Mutex::new(None));
 
+        let sender_flasher = flasher.clone();
         let sender_outbox = outbox.clone();
         let sender_url = url.clone();
         crate::worker::spawn("wled-send", move |shutdown| {
             let Some(mut wled) = initialize(&sender_url, CONNECT_RETRY_INTERVAL, &shutdown) else {
                 return;
             };
+            match Flasher::connect(&mut wled) {
+                Ok(connected) => {
+                    if let Ok(mut flasher) = sender_flasher.lock() {
+                        *flasher = Some(connected);
+                    }
+                }
+                Err(err) => warn!("WLED at {sender_url} will not flash: {err:#}"),
+            }
             while let Some(state) = sender_outbox.take(&shutdown) {
                 wled.state = Some(state);
                 debug!("Sending WLED state to {sender_url}.");
@@ -63,7 +83,36 @@ impl WledController {
             info!("WLED sender thread for {sender_url} shutting down.");
         });
 
-        Self { url, outbox }
+        Self {
+            url,
+            outbox,
+            flasher,
+        }
+    }
+
+    /// Light every LED white at `level`, over whatever the node is showing.
+    ///
+    /// Call once per frame for as long as the flash lasts, then
+    /// [`Self::end_flash`].
+    pub fn flash(&self, level: u8) {
+        self.with_flasher(|flasher| flasher.flash(level));
+    }
+
+    /// Return the node to what it was showing before a flash.
+    pub fn end_flash(&self) {
+        self.with_flasher(|flasher| flasher.realtime.release());
+    }
+
+    fn with_flasher(&self, action: impl FnOnce(&mut Flasher) -> std::io::Result<()>) {
+        let Ok(mut flasher) = self.flasher.lock() else {
+            return;
+        };
+        let Some(flasher) = flasher.as_mut() else {
+            return;
+        };
+        if let Err(err) = action(flasher) {
+            debug!("failed to flash WLED at {}: {err}", self.url);
+        }
     }
 
     /// Send a WLED control message.
@@ -89,6 +138,40 @@ impl WledController {
 impl Drop for WledController {
     fn drop(&mut self) {
         self.outbox.close();
+    }
+}
+
+/// Lights all of a node's LEDs directly, bypassing its JSON API.
+#[derive(Debug)]
+struct Flasher {
+    realtime: Realtime,
+    led_count: u16,
+}
+
+impl Flasher {
+    /// Ask the node how many LEDs it has and where it takes realtime data.
+    fn connect(wled: &mut Wled) -> Result<Self> {
+        wled.get_info_from_wled()
+            .context("failed to read the node's info")?;
+        let info = wled.info.as_ref().context("the node sent no info")?;
+        let led_count = info
+            .leds
+            .as_ref()
+            .and_then(|leds| leds.count)
+            .context("the node did not report its LED count")?;
+        let host = wled.url.host_str().context("the node's URL has no host")?;
+        let udp_port = info.udpport.unwrap_or(DEFAULT_UDP_PORT);
+        let realtime = Realtime::connect((host, udp_port), FLASH_TIMEOUT_SECS)
+            .context("failed to open a UDP socket to the node")?;
+        Ok(Self {
+            realtime,
+            led_count,
+        })
+    }
+
+    fn flash(&mut self, level: u8) -> std::io::Result<()> {
+        let white = std::iter::repeat_n([level; 3], usize::from(self.led_count));
+        self.realtime.show(0, white)
     }
 }
 
@@ -196,7 +279,42 @@ pub enum WledControlMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{fake::FakeWled, *};
+    use super::{
+        fake::{self, FakeWled},
+        *,
+    };
+
+    /// A flash lights every LED the node reports, then hands them back.
+    #[test]
+    fn controller_flashes_every_led_then_releases() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+
+        // The controller cannot flash until it has heard from the node.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let packet = loop {
+            controller.flash(200);
+            if let Some(packet) = fake.next_realtime_packet(Duration::from_millis(50)) {
+                break packet;
+            }
+            assert!(std::time::Instant::now() < deadline, "no flash arrived");
+        };
+        assert_eq!(packet[..4], [4, FLASH_TIMEOUT_SECS, 0, 0]);
+        let leds = &packet[4..];
+        assert_eq!(leds.len(), usize::from(fake::LED_COUNT) * 3);
+        assert!(leds.iter().all(|&channel| channel == 200));
+
+        // Drain any flashes sent while the first was in flight.
+        while fake
+            .next_realtime_packet(Duration::from_millis(50))
+            .is_some()
+        {}
+        controller.end_flash();
+        assert_eq!(
+            fake.next_realtime_packet(Duration::from_secs(5)),
+            Some(vec![4, 0])
+        );
+    }
 
     #[test]
     fn controller_posts_state_without_a_transition() {
