@@ -747,7 +747,7 @@ mod tests {
         port.write(&[1, 2, 3]).unwrap();
         assert_eq!(
             fake.next_realtime_packet(Duration::from_secs(5)),
-            Some(vec![4, 2, 0, 0, 1, 2, 3])
+            Some(vec![4, 2, 0, 0, 1, 2, 3, 0])
         );
     }
 
