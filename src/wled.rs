@@ -51,6 +51,11 @@ const MIN_SEND_INTERVAL: Duration = Duration::from_millis(20);
 /// How long to wait before telling a node again what it failed to take.
 const RESEND_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How much later than before a node must claim to have started for us to
+/// take it that it restarted. Uptime comes in whole seconds and takes a
+/// moment to fetch.
+const RESTART_MARGIN_SECS: i64 = 5;
+
 /// How long a node is given to load a preset before it is told anything
 /// that the preset must not override.
 const PRESET_LOAD_TIME: Duration = Duration::from_millis(250);
@@ -377,6 +382,11 @@ struct Link {
     after_preset: Option<Instant>,
     /// Whether we have already said that the node is not answering.
     unreachable: bool,
+    /// When this link was made; the clock boot times are kept on.
+    created: Instant,
+    /// When the node started, in seconds since `created`. Negative for a
+    /// node that was up before we were.
+    booted: Option<i64>,
 }
 
 /// What became of a state we tried to send.
@@ -393,6 +403,13 @@ enum Sent {
 
 impl Link {
     fn new(wled: Wled) -> Self {
+        let mut link = Self::unacquainted(wled);
+        // The node has usually described itself by now, to the flasher.
+        link.booted = link.boot_time();
+        link
+    }
+
+    fn unacquainted(wled: Wled) -> Self {
         Self {
             wled,
             socket: None,
@@ -402,6 +419,8 @@ impl Link {
             resend_at: None,
             after_preset: None,
             unreachable: false,
+            created: Instant::now(),
+            booted: None,
         }
     }
 
@@ -441,33 +460,63 @@ impl Link {
         self.finish_resync();
     }
 
-    /// Tell the node everything it should be showing.
+    /// Tell the node what it should be showing.
     ///
-    /// WLED applies the other fields of a message before it loads the preset
-    /// the message names, and the preset then overrides them. So a node that
-    /// should be on a preset is sent the preset alone, and the rest once it
-    /// has had time to load it.
+    /// A node that only dropped its connection still has its preset, and
+    /// loading it again would show for a moment on stage, so the preset is
+    /// sent only to a node that has restarted. WLED applies the other fields
+    /// of a message before it loads the preset the message names, and the
+    /// preset then overrides them, so the preset goes alone and the rest
+    /// follows once the node has had time to load it.
     fn resync(&mut self) {
         let Some(told) = self.told.clone() else {
             self.resend_at = None;
             return;
         };
-        let has_preset = told.ps.is_some();
-        let first = if has_preset {
-            State {
+        let Some(restarted) = self.node_restarted() else {
+            self.missed("the node did not say how long it has been up");
+            self.resend_at = Some(Instant::now() + RESEND_INTERVAL);
+            return;
+        };
+        let (first, follows) = if restarted && told.ps.is_some() {
+            let preset = State {
                 ps: told.ps,
                 tt: told.tt,
                 ..Default::default()
-            }
+            };
+            (preset, true)
         } else {
-            told
+            (without_preset(told), false)
         };
-        if self.transmit(first) == Sent::Missed {
+        if has_content(&first) && self.transmit(first) == Sent::Missed {
             self.resend_at = Some(Instant::now() + RESEND_INTERVAL);
             return;
         }
         self.resend_at = None;
-        self.after_preset = has_preset.then(|| Instant::now() + PRESET_LOAD_TIME);
+        self.after_preset = follows.then(|| Instant::now() + PRESET_LOAD_TIME);
+    }
+
+    /// Whether the node has restarted since we last asked, or None if it did
+    /// not answer.
+    fn node_restarted(&mut self) -> Option<bool> {
+        self.wled.get_info_from_wled().ok()?;
+        let booted = self.boot_time();
+        let restarted = match (self.booted, booted) {
+            (Some(before), Some(now)) => now > before.saturating_add(RESTART_MARGIN_SECS),
+            // A node that does not report its uptime is assumed to have lost
+            // everything.
+            _ => true,
+        };
+        self.booted = booted.or(self.booted);
+        Some(restarted)
+    }
+
+    /// When the node started, by the info it last sent, in seconds on our
+    /// own clock.
+    fn boot_time(&self) -> Option<i64> {
+        let uptime = self.wled.info.as_ref()?.uptime?;
+        let now = i64::try_from(self.created.elapsed().as_secs()).ok()?;
+        Some(now.saturating_sub(i64::from(uptime)))
     }
 
     /// Send what was held back for a preset to load, once it has.
@@ -476,12 +525,13 @@ impl Link {
             return;
         }
         self.after_preset = None;
-        let Some(mut rest) = self.told.clone() else {
+        let Some(rest) = self.told.clone().map(without_preset) else {
             return;
         };
-        rest.ps = None;
-        let sent = self.transmit(rest);
-        self.note(sent);
+        if has_content(&rest) {
+            let sent = self.transmit(rest);
+            self.note(sent);
+        }
     }
 
     /// Arrange to tell the node again whatever a send may have cost it.
@@ -590,7 +640,11 @@ fn supersede(unsent: Option<State>, mut newer: State) -> State {
     };
     newer.on = newer.on.or(unsent.on);
     newer.bri = newer.bri.or(unsent.bri);
-    newer.ps = newer.ps.or(unsent.ps);
+    // An effect, palette or colour picked after a preset replaces it. Sent
+    // together, the node would load the preset last and lose the choice.
+    if !sets_look(&newer) {
+        newer.ps = newer.ps.or(unsent.ps);
+    }
     newer.seg = match (newer.seg.take(), unsent.seg) {
         (Some(mut newer_segs), Some(unsent_segs)) => {
             // Fixtures only ever address the first segment.
@@ -619,25 +673,46 @@ fn supersede_seg(newer: &mut Seg, unsent: Seg) {
 /// Add `state` to what a node has been told, giving what to send a node that
 /// has lost track: one that restarted, or dropped off the network for a while.
 ///
-/// A preset brings its own look and picking an effect, palette or colour
-/// replaces the preset's, so whichever came last is the one kept.
+/// A preset brings its own effect, palette, colour, speed and size, and
+/// overrides any sent along with it, so picking one leaves only the preset
+/// and the level to remember. Picking an effect, palette or colour afterwards
+/// replaces the preset.
 fn remember(told: Option<State>, state: &State) -> State {
-    let sets_look = state
-        .seg
-        .as_ref()
-        .and_then(|segs| segs.first())
-        .is_some_and(|seg| seg.fx.is_some() || seg.pal.is_some() || seg.col.is_some());
+    if state.ps.is_some() {
+        let told = told.unwrap_or_default();
+        return State {
+            ps: state.ps,
+            tt: state.tt,
+            on: state.on.or(told.on),
+            bri: state.bri.or(told.bri),
+            ..Default::default()
+        };
+    }
     let mut told = supersede(told, state.clone());
-    if state.ps.is_some() && !sets_look {
-        if let Some(seg) = told.seg.as_mut().and_then(|segs| segs.first_mut()) {
-            seg.fx = None;
-            seg.pal = None;
-            seg.col = None;
-        }
-    } else if sets_look {
+    if sets_look(state) {
         told.ps = None;
     }
     told
+}
+
+/// Whether `state` chooses an effect, palette or colour.
+fn sets_look(state: &State) -> bool {
+    state
+        .seg
+        .as_ref()
+        .and_then(|segs| segs.first())
+        .is_some_and(|seg| seg.fx.is_some() || seg.pal.is_some() || seg.col.is_some())
+}
+
+/// `state` with no preset selection.
+fn without_preset(mut state: State) -> State {
+    state.ps = None;
+    state
+}
+
+/// Whether `state` would change anything on a node.
+fn has_content(state: &State) -> bool {
+    state.ps.is_some() || state.on.is_some() || state.bri.is_some() || state.seg.is_some()
 }
 
 /// Poll the WLED API until we get a good config back.
@@ -983,7 +1058,7 @@ mod tests {
         assert_eq!(fake.next_state().bri, Some(20));
 
         std::thread::sleep(Duration::from_millis(50));
-        fake.drop_websockets();
+        fake.restart();
 
         let first = fake.next_state();
         assert_eq!(first.ps, Some(3));
@@ -993,6 +1068,77 @@ mod tests {
         assert_eq!(second.ps, None);
         assert_eq!(second.bri, Some(20));
         assert!(asked_for_preset.elapsed() >= PRESET_LOAD_TIME / 2);
+    }
+
+    /// A node that only dropped its connection still has its preset. Loading
+    /// it again would show on stage, so only the level is sent.
+    #[test]
+    fn node_that_only_lost_its_socket_is_not_sent_its_preset_again() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        controller.send(WledControlMessage::SetState(preset(3)));
+        assert_eq!(fake.next_state().ps, Some(3));
+        controller.send(WledControlMessage::SetState(level(20)));
+        assert_eq!(fake.next_state().bri, Some(20));
+
+        std::thread::sleep(Duration::from_millis(50));
+        fake.drop_websockets();
+
+        let state = fake.next_state();
+        assert_eq!(state.ps, None);
+        assert_eq!(state.bri, Some(20));
+    }
+
+    /// A node that loses power closes nothing: what we send is accepted by
+    /// our own side and goes nowhere. Its silence is what gives it away.
+    #[test]
+    fn node_that_goes_silent_is_noticed_and_told_again() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        controller.send(WledControlMessage::SetState(level(20)));
+        assert_eq!(fake.next_posted().0, Transport::WebSocket);
+        // Silence only counts against a node known to answer heartbeats.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fake.heartbeats() == 0 {
+            assert!(Instant::now() < deadline, "no heartbeat arrived");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        fake.go_silent();
+
+        let posted = fake
+            .posted_within(Duration::from_secs(10))
+            .expect("the node was never told again");
+        assert_eq!(posted.0, Transport::Http);
+        assert_eq!(posted.1.bri, Some(20));
+    }
+
+    /// An effect picked after a preset replaces it. Sent in one message the
+    /// node would load the preset last, so the preset is dropped.
+    #[test]
+    fn unsent_preset_gives_way_to_a_newer_look() {
+        let state = supersede(Some(preset(3)), look(108));
+        assert_eq!(state.ps, None);
+        assert_eq!(state.seg.unwrap().remove(0).fx, Some(108));
+    }
+
+    /// A preset overrides the speed and size sent along with it, so they
+    /// are not what the node is showing and are not remembered.
+    #[test]
+    fn remembered_preset_forgets_the_speed_sent_with_it() {
+        let with_speed = State {
+            ps: Some(3),
+            seg: Some(vec![Seg {
+                sx: Some(200),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let told = remember(Some(level(20)), &with_speed);
+        assert_eq!(told.ps, Some(3));
+        assert_eq!(told.bri, Some(20));
+        assert_eq!(told.seg, None);
     }
 
     /// Picking an effect replaces a preset's look, so a node brought up to
@@ -1012,7 +1158,7 @@ mod tests {
         let told = remember(Some(told), &preset(3));
         assert_eq!(told.ps, Some(3));
         assert_eq!(told.bri, Some(20));
-        assert_eq!(told.seg.unwrap().remove(0).fx, None);
+        assert_eq!(told.seg, None);
     }
 
     /// A node that cannot describe itself when first reached learns to flash

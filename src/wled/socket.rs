@@ -26,10 +26,23 @@ pub struct StateSocket {
     socket: WebSocket<TcpStream>,
     /// When we last sent the node anything.
     sent: Instant,
+    /// When the node last sent us anything.
+    heard: Instant,
+    /// Whether the node has ever answered a heartbeat. Firmware that
+    /// predates the heartbeat stays silent, and must not be taken for dead.
+    answers_heartbeat: bool,
 }
 
 /// How long a socket may sit quiet before we ping the node.
-const PING_INTERVAL: Duration = Duration::from_secs(2);
+const PING_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a node that answers heartbeats may go without sending anything
+/// before we take it to be gone. A node that loses power closes nothing, and
+/// what we send it is accepted by our own side for a long time afterwards.
+const SILENCE_LIMIT: Duration = Duration::from_secs(3);
+
+/// What WLED answers a heartbeat with.
+const HEARTBEAT_ANSWER: &str = "pong";
 
 /// The text WLED takes as a heartbeat.
 const HEARTBEAT: &str = "p";
@@ -60,6 +73,8 @@ impl StateSocket {
         Ok(Self {
             socket,
             sent: Instant::now(),
+            heard: Instant::now(),
+            answers_heartbeat: false,
         })
     }
 
@@ -77,8 +92,9 @@ impl StateSocket {
     /// if we have sent nothing for a while.
     ///
     /// A node that restarts leaves no trace on a quiet connection. The ping
-    /// draws a reset out of it, so the loss shows up here rather than on the
-    /// operator's next move. WLED does not answer WebSocket ping frames; its
+    /// draws a reset out of it, or goes unanswered by a node that is gone,
+    /// so the loss shows up here rather than on the operator's next move.
+    /// WLED does not answer WebSocket ping frames; its
     /// own heartbeat is a text message, which it answers with "pong".
     pub fn keep_alive(&mut self) -> Result<()> {
         if self.sent.elapsed() >= PING_INTERVAL {
@@ -100,17 +116,27 @@ impl StateSocket {
         for _ in 0..MAX_DRAINED_MESSAGES {
             match self.socket.read() {
                 Ok(Message::Close(_)) => bail!("the node closed the WebSocket"),
-                Ok(_) => {}
+                Ok(message) => {
+                    self.heard = Instant::now();
+                    if let Message::Text(text) = &message
+                        && text.as_str() == HEARTBEAT_ANSWER
+                    {
+                        self.answers_heartbeat = true;
+                    }
+                }
                 Err(tungstenite::Error::Io(err))
                     if matches!(
                         err.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    return Ok(());
+                    break;
                 }
                 Err(err) => return Err(err).context("the WebSocket failed"),
             }
+        }
+        if self.answers_heartbeat && self.heard.elapsed() > SILENCE_LIMIT {
+            bail!("the node has stopped answering");
         }
         Ok(())
     }

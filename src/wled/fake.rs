@@ -4,10 +4,10 @@ use std::{
     net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{Receiver, Sender, channel},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use reqwest::Url;
@@ -42,7 +42,6 @@ pub struct FakeWled {
 }
 
 /// The ways a test can make the fake misbehave.
-#[derive(Default)]
 struct Faults {
     /// The WebSocket connections currently open.
     sockets: Mutex<Vec<TcpStream>>,
@@ -50,6 +49,32 @@ struct Faults {
     info_failures: AtomicUsize,
     /// How many heartbeats have arrived over WebSockets.
     heartbeats: AtomicUsize,
+    /// Whether WebSockets have stopped answering, as when a node loses
+    /// power.
+    silent: AtomicBool,
+    /// When the node last started.
+    booted: Mutex<Instant>,
+    /// How long the node had been up at `booted`, in seconds.
+    uptime_at_boot: AtomicUsize,
+}
+
+impl Faults {
+    fn new() -> Self {
+        Self {
+            sockets: Mutex::default(),
+            info_failures: AtomicUsize::new(0),
+            heartbeats: AtomicUsize::new(0),
+            silent: AtomicBool::new(false),
+            booted: Mutex::new(Instant::now()),
+            // A node that has been running for a while.
+            uptime_at_boot: AtomicUsize::new(1000),
+        }
+    }
+
+    fn uptime(&self) -> u64 {
+        self.booted.lock().unwrap().elapsed().as_secs()
+            + self.uptime_at_boot.load(Ordering::SeqCst) as u64
+    }
 }
 
 impl FakeWled {
@@ -69,7 +94,7 @@ impl FakeWled {
         let realtime = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let udp_port = realtime.local_addr().unwrap().port();
         let (send, posted) = channel();
-        let faults = Arc::new(Faults::default());
+        let faults = Arc::new(Faults::new());
         let serving_faults = faults.clone();
         // Serves until the test process exits.
         std::thread::spawn(move || {
@@ -97,6 +122,19 @@ impl FakeWled {
         }
     }
 
+    /// Restart the node: its connections drop and its uptime starts again.
+    pub fn restart(&self) {
+        *self.faults.booted.lock().unwrap() = Instant::now();
+        self.faults.uptime_at_boot.store(0, Ordering::SeqCst);
+        self.drop_websockets();
+    }
+
+    /// Stop answering over WebSockets without closing them, as a node that
+    /// loses power does.
+    pub fn go_silent(&self) {
+        self.faults.silent.store(true, Ordering::SeqCst);
+    }
+
     /// How many heartbeats have arrived over WebSockets.
     pub fn heartbeats(&self) -> usize {
         self.faults.heartbeats.load(Ordering::SeqCst)
@@ -116,6 +154,11 @@ impl FakeWled {
     /// arrives.
     pub fn next_posted(&self) -> (Transport, State) {
         self.posted.recv_timeout(Duration::from_secs(5)).unwrap()
+    }
+
+    /// The next state posted within `timeout` and how it arrived, if any.
+    pub fn posted_within(&self, timeout: Duration) -> Option<(Transport, State)> {
+        self.posted.recv_timeout(timeout).ok()
     }
 
     /// The next realtime packet sent within `timeout`, if any.
@@ -155,6 +198,9 @@ fn serve_websocket(stream: TcpStream, posted: &Sender<(Transport, State)>, fault
     // WLED greets every client with its state and info.
     let _ = socket.send(Message::text(r#"{"state":{},"info":{}}"#));
     while let Ok(message) = socket.read() {
+        if faults.silent.load(Ordering::SeqCst) {
+            continue;
+        }
         if let Message::Text(text) = &message
             && text.as_str() == "p"
         {
@@ -213,7 +259,8 @@ fn serve_http(
         ("500 Internal Server Error", String::new())
     } else if request_line.starts_with("GET /json/info") {
         let info = format!(
-            r#"{{"ver":"0.15.0","leds":{{"count":{LED_COUNT},"rgbw":true}},"udpport":{udp_port}}}"#
+            r#"{{"ver":"0.15.0","leds":{{"count":{LED_COUNT},"rgbw":true}},"udpport":{udp_port},"uptime":{}}}"#,
+            faults.uptime()
         );
         ("200 OK", info)
     } else if request_line.starts_with("GET /presets.json") {
