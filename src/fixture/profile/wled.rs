@@ -3,11 +3,50 @@
 use std::{num::NonZeroU8, time::Duration};
 
 use crate::{
+    color::{Hsv, RenderColor},
     fixture::prelude::*,
     strobe::FlashState,
     wled::{WledControlMessage, WledController, WledUrl},
 };
 use wled_json_api_library::structures::state::{Seg, State};
+
+/// The effects offered on the control surface, by WLED effect ID.
+///
+/// WLED has far more than fit on a control surface. The first nine advance a
+/// stored phase each frame, so riding Speed bends their motion. The last three
+/// derive position from the clock, as most WLED effects do, and jump when Speed
+/// changes; they are here because they are the looks people reach for.
+const EFFECTS: [(&str, u8); 12] = [
+    ("Solid", 0),
+    ("Sine", 108),
+    ("Phased", 105),
+    ("Noise", 70),
+    ("Aurora", 38),
+    ("Ripple", 79),
+    ("Rain", 43),
+    ("Dissolve", 18),
+    ("Candle", 88),
+    ("Rainbow", 9),
+    ("Chase", 28),
+    ("Fire", 66),
+];
+
+/// The palettes offered on the control surface, by WLED palette ID.
+///
+/// Color and Gradient are built from the colour set by Hue and Sat; Default
+/// leaves the choice to the effect.
+const PALETTES: [(&str, u8); 10] = [
+    ("Default", 0),
+    ("Color", 2),
+    ("Gradient", 4),
+    ("Party", 6),
+    ("Lava", 8),
+    ("Ocean", 9),
+    ("Forest", 10),
+    ("Rainbow", 11),
+    ("Sunset", 13),
+    ("Fire", 35),
+];
 
 #[derive(Debug, EmitState, Control, DescribeControls)]
 pub struct Wled {
@@ -22,6 +61,15 @@ pub struct Wled {
     size: ChannelKnobUnipolar<Unipolar<()>>,
     #[on_change = "update_preset"]
     preset: IndexedSelect<()>,
+    #[on_change = "update_look"]
+    effect: LabeledSelect,
+    #[on_change = "update_look"]
+    palette: LabeledSelect,
+    /// The effect's primary colour.
+    #[on_change = "update_look"]
+    hue: PhaseControl<()>,
+    #[on_change = "update_look"]
+    sat: Unipolar<()>,
     /// Let pixel ports drive this node. When off they stand down and the node
     /// shows its own effect.
     #[on_change = "update_pixels"]
@@ -61,6 +109,10 @@ impl PatchFixture for Wled {
                 false,
                 (),
             ),
+            effect: LabeledSelect::new("Effect", 0, EFFECTS.to_vec()),
+            palette: LabeledSelect::new("Palette", 0, PALETTES.to_vec()),
+            hue: PhaseControl::new("Hue", ()).at_half(),
+            sat: Unipolar::new("Sat", ()).at_full(),
             pixels: Bool::new_on("Pixels", ()),
             controller: WledController::run(options.url.0),
             flash: FlashState::new(FLASH_RESPONSE),
@@ -150,6 +202,31 @@ impl Wled {
         self.controller.send(WledControlMessage::SetState(state));
     }
 
+    /// Set the effect, its palette and its colour.
+    ///
+    /// These go out only when one of them changes, not with every fader move,
+    /// so that a preset keeps its own look until the operator picks another.
+    fn set_look(&self, state: &mut State) {
+        let color = Hsv {
+            hue: self.hue.val(),
+            sat: self.sat.val(),
+            val: UnipolarFloat::ONE,
+        };
+        let seg = get_seg(state);
+        seg.fx = Some(u16::from(self.effect.dmx_val()));
+        seg.pal = Some(u16::from(self.palette.dmx_val()));
+        seg.col = Some(vec![color.rgb().to_vec()]);
+    }
+
+    fn update_look(&self, _emitter: &FixtureStateEmitter) {
+        let mut state = State::default();
+        self.set_level(&mut state);
+        self.set_speed(&mut state);
+        self.set_size(&mut state);
+        self.set_look(&mut state);
+        self.controller.send(WledControlMessage::SetState(state));
+    }
+
     fn update_pixels(&self, _emitter: &FixtureStateEmitter) {
         self.controller.allow_pixels(self.pixels.val());
     }
@@ -174,6 +251,47 @@ fn get_seg(state: &mut State) -> &mut Seg {
         seg.push(Default::default());
     }
     &mut seg[0]
+}
+
+#[cfg(test)]
+mod tests {
+    use rosc::{OscMessage, OscType};
+
+    use crate::channel::mock::no_op_emitter;
+    use crate::config::{GroupId, GroupName, Options};
+    use crate::fixture::patch::PATCHERS;
+    use crate::osc::{OscClientId, OscControlMessage};
+    use crate::wled::fake::FakeWled;
+
+    /// Picking an effect on the control surface sends the node that effect
+    /// along with the palette and colour the other controls are set to.
+    #[test]
+    fn picking_an_effect_sends_the_whole_look() {
+        let fake = FakeWled::start();
+        let patcher = PATCHERS.iter().find(|p| p.name.0 == "Wled").unwrap();
+        let options = Options::from_entries([
+            ("url".to_string(), fake.url.as_str().into()),
+            ("preset_count".to_string(), 3.into()),
+        ]);
+        let mut group =
+            (patcher.create_group)(GroupId::new(), GroupName("wled".to_string()), options).unwrap();
+
+        let pick_sine = OscControlMessage::new(
+            OscMessage {
+                addr: "/wled/Effect/Sine".to_string(),
+                args: vec![OscType::Float(1.0)],
+            },
+            OscClientId::example(),
+        )
+        .unwrap();
+        group.control(&pick_sine, no_op_emitter()).unwrap();
+
+        let seg = fake.next_state().seg.unwrap().remove(0);
+        assert_eq!(seg.fx, Some(108));
+        assert_eq!(seg.pal, Some(0));
+        // Hue at its midpoint and full saturation.
+        assert_eq!(seg.col.unwrap().len(), 1);
+    }
 }
 
 pub mod rug_doctor {

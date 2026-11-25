@@ -16,7 +16,10 @@ use anyhow::{Context, Result};
 
 use reqwest::Url;
 use serde::Deserialize;
-use wled_json_api_library::{structures::state::State, wled::Wled};
+use wled_json_api_library::{
+    structures::state::{Seg, State},
+    wled::Wled,
+};
 
 use crate::worker::Shutdown;
 use discovery::DEFAULT_UDP_PORT;
@@ -396,8 +399,29 @@ fn supersede(unsent: Option<State>, mut newer: State) -> State {
     newer.on = newer.on.or(unsent.on);
     newer.bri = newer.bri.or(unsent.bri);
     newer.ps = newer.ps.or(unsent.ps);
-    newer.seg = newer.seg.or(unsent.seg);
+    newer.seg = match (newer.seg.take(), unsent.seg) {
+        (Some(mut newer_segs), Some(unsent_segs)) => {
+            // Fixtures only ever address the first segment.
+            if let (Some(newer_seg), Some(unsent_seg)) =
+                (newer_segs.first_mut(), unsent_segs.into_iter().next())
+            {
+                supersede_seg(newer_seg, unsent_seg);
+            }
+            Some(newer_segs)
+        }
+        (newer_segs, unsent_segs) => newer_segs.or(unsent_segs),
+    };
     newer
+}
+
+/// Fold an unsent segment into the newer one that replaces it, field by field
+/// as [`supersede`] does.
+fn supersede_seg(newer: &mut Seg, unsent: Seg) {
+    newer.fx = newer.fx.or(unsent.fx);
+    newer.sx = newer.sx.or(unsent.sx);
+    newer.ix = newer.ix.or(unsent.ix);
+    newer.pal = newer.pal.or(unsent.pal);
+    newer.col = newer.col.take().or(unsent.col);
 }
 
 /// Poll the WLED API until we get a good config back.
@@ -598,6 +622,30 @@ mod tests {
         let state = supersede(Some(level(20)), preset(3));
         assert_eq!(state.ps, Some(3));
         assert_eq!(state.bri, Some(20));
+    }
+
+    /// An effect picked just before a fader moved must still reach WLED.
+    #[test]
+    fn unsent_effect_survives_a_newer_speed() {
+        let effect = State {
+            seg: Some(vec![Seg {
+                fx: Some(108),
+                sx: Some(10),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let speed = State {
+            seg: Some(vec![Seg {
+                sx: Some(200),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let seg = supersede(Some(effect), speed).seg.unwrap().remove(0);
+        assert_eq!(seg.fx, Some(108));
+        assert_eq!(seg.sx, Some(200));
     }
 
     #[test]
