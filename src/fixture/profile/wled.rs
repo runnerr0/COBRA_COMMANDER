@@ -4,9 +4,8 @@ use std::num::NonZeroU8;
 
 use crate::{
     fixture::prelude::*,
-    wled::{WledControlMessage, WledController},
+    wled::{WledControlMessage, WledController, WledUrl},
 };
-use reqwest::Url;
 use wled_json_api_library::structures::state::{Seg, State};
 
 #[derive(Debug, EmitState, Control, DescribeControls, Update)]
@@ -30,7 +29,7 @@ pub struct Wled {
 #[derive(Deserialize, OptionsMenu)]
 #[serde(deny_unknown_fields)]
 pub struct GroupOptions {
-    pub url: Url,
+    pub url: WledUrl,
     pub preset_count: NonZeroU8,
 }
 
@@ -50,7 +49,7 @@ impl PatchFixture for Wled {
                 false,
                 (),
             ),
-            controller: WledController::run(options.url),
+            controller: WledController::run(options.url.0),
         }
     }
 

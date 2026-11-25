@@ -6,9 +6,12 @@ use std::{
 };
 
 use reqwest::Url;
+use serde::Deserialize;
 use wled_json_api_library::{structures::state::State, wled::Wled};
 
 use crate::worker::Shutdown;
+
+pub mod discovery;
 
 /// How long to wait between attempts to reach a WLED instance at startup.
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -21,6 +24,11 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// WLED otherwise fades every change over its configured transition time,
 /// which makes a live control lag behind the hand moving it.
 const TRANSITION: u8 = 0;
+
+/// The URL of a WLED node's HTTP API.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct WledUrl(pub Url);
 
 #[derive(Debug)]
 pub struct WledController {

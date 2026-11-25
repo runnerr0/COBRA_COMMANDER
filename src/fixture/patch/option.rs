@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, de};
 use strum::IntoEnumIterator;
 use url::Url;
 
-use crate::{config::Options, fixture::fixture::EnumRenderModel};
+use crate::{config::Options, fixture::fixture::EnumRenderModel, wled::WledUrl};
 /// A type that fixtures can use to declare that they do not accept patch options.
 #[derive(Deserialize)]
 #[serde(try_from = "ParseNoOptions")]
@@ -66,6 +66,12 @@ impl AsPatchOption for SocketAddr {
 impl AsPatchOption for Url {
     fn as_patch_option() -> PatchOption {
         PatchOption::Url
+    }
+}
+
+impl AsPatchOption for WledUrl {
+    fn as_patch_option() -> PatchOption {
+        PatchOption::WledUrl
     }
 }
 
@@ -165,6 +171,9 @@ pub enum PatchOption {
     SocketAddr,
     /// A URL.
     Url,
+    /// The URL of a WLED node, which can be picked from those discovered on
+    /// the network.
+    WledUrl,
     /// A boolean option.
     Bool,
     /// A bipolar float in the range [-1, 1].
@@ -186,7 +195,9 @@ impl PatchOption {
             PatchOption::Unipolar => Value::Number(1.0.into()),
             PatchOption::Select(opts) => Value::String(opts[0].clone()),
             PatchOption::SocketAddr => Value::String("127.0.0.1:9999".into()),
-            PatchOption::Url => Value::String("http://127.0.0.1:9999".into()),
+            PatchOption::Url | PatchOption::WledUrl => {
+                Value::String("http://127.0.0.1:9999".into())
+            }
             PatchOption::Optional(inner) => inner.example_value(),
         }
     }
@@ -200,6 +211,7 @@ impl Display for PatchOption {
             Self::Select(opts) => f.write_str(&opts.join(", ")),
             Self::SocketAddr => f.write_str("<socket address>"),
             Self::Url => f.write_str("<url>"),
+            Self::WledUrl => f.write_str("<WLED node url>"),
             Self::Bool => f.write_str("true, false"),
             Self::Bipolar => f.write_str("<bipolar float, -1..1>"),
             Self::Unipolar => f.write_str("<unipolar float, 0..1>"),

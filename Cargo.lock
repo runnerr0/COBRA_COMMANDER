@@ -958,6 +958,7 @@ dependencies = [
  "linkme",
  "local-ip-address",
  "log",
+ "mdns-sd",
  "midi_harness",
  "num-derive",
  "num-traits",

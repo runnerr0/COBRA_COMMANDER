@@ -13,14 +13,15 @@ use crate::dmx::DmxAddr;
 use crate::fixture::patch::{PatchOption, Patcher};
 use crate::gui_state::PatchSnapshot;
 use crate::ui_util::{GuiContext, char_width_for, row_height_for};
+use crate::wled::discovery::WledDiscovery;
 use gui_common::{
     STATUS_COLORS, cancel_button, confirm_button, confirm_button_enabled, dnd_reorder,
 };
 
 use address_map::{AddressMap, UniverseAddress};
 use widgets::{
-    build_options_from_form, default_for_option, render_address_map, render_option_widget,
-    validate_option,
+    build_options_from_form, default_for_option, offers_wled_nodes, render_address_map,
+    render_option_widget, validate_option,
 };
 use working_copy::PatchWorkingCopy;
 
@@ -148,6 +149,8 @@ pub struct PatchPanelState {
     /// Per-group add-fixture form drafts, keyed by stable GroupId so each
     /// group's in-progress entry survives switching away and back.
     add_fixture_forms: HashMap<GroupId, AddFixtureForm>,
+    /// WLED nodes on the network, offered by options that take one.
+    wled_discovery: WledDiscovery,
 }
 
 impl PatchPanelState {
@@ -159,6 +162,7 @@ impl PatchPanelState {
             mode: PanelMode::View,
             pending_delete: None,
             add_fixture_forms: HashMap::new(),
+            wled_discovery: WledDiscovery::Idle,
         }
     }
 }
@@ -911,11 +915,16 @@ impl PatchPanel<'_> {
         if let Some(patcher) = patcher {
             let menu = (patcher.group_options)();
             if !menu.is_empty() {
+                let wled_nodes = if offers_wled_nodes(&menu) {
+                    self.state.wled_discovery.nodes()
+                } else {
+                    Vec::new()
+                };
                 ui.add_space(4.0);
                 for (menu_key, menu_opt) in &menu {
                     if let Some(entry) = form.group_options.iter_mut().find(|(k, _)| k == menu_key)
                     {
-                        render_option_widget(ui, menu_key, menu_opt, &mut entry.1);
+                        render_option_widget(ui, menu_key, menu_opt, &mut entry.1, &wled_nodes);
                         if let Err(msg) = validate_option(menu_opt, &entry.1) {
                             ui.colored_label(STATUS_COLORS.error_text, &msg);
                             all_valid = false;
@@ -1041,9 +1050,14 @@ impl PatchPanel<'_> {
         if let Some(patcher) = patcher {
             let patch_menu = (patcher.patch_options)();
             if !patch_menu.is_empty() {
+                let wled_nodes = if offers_wled_nodes(&patch_menu) {
+                    self.state.wled_discovery.nodes()
+                } else {
+                    Vec::new()
+                };
                 for (opt_key, opt_type) in &patch_menu {
                     if let Some(entry) = form.patch_options.iter_mut().find(|(k, _)| k == opt_key) {
-                        render_option_widget(ui, opt_key, opt_type, &mut entry.1);
+                        render_option_widget(ui, opt_key, opt_type, &mut entry.1, &wled_nodes);
                         if let Err(msg) = validate_option(opt_type, &entry.1) {
                             ui.colored_label(STATUS_COLORS.error_text, &msg);
                             all_valid = false;
@@ -1952,6 +1966,71 @@ mod test {
             Some(0),
             "Expected pending_delete=Some(0), got {:?}",
             state.pending_delete
+        );
+    }
+
+    /// Fixture whose only group option is the WLED node to control.
+    fn mock_wled_patcher() -> Patcher {
+        Patcher {
+            name: FixtureType("WledNode"),
+            patch_notes: "",
+            create_group: |_, _, _| unimplemented!(),
+            group_options: || vec![("url".into(), PatchOption::WledUrl)],
+            create_patch: |_, _| {
+                Ok(PatchConfig {
+                    channel_count: 0,
+                    render_mode: None,
+                })
+            },
+            patch_options: || vec![],
+        }
+    }
+
+    /// Picking a discovered WLED node in the add-group form fills in its URL.
+    #[test]
+    fn picking_a_discovered_wled_node_fills_in_its_url() {
+        use crate::wled::discovery::{WledNode, mock::FixedWledBrowser};
+
+        let client = auto_respond_client();
+        let snapshot = test_snapshot_empty();
+        let patchers = vec![mock_wled_patcher()];
+        let mut modal = MessageModal::default();
+        let mut state = PatchPanelState::new();
+        state.wled_discovery =
+            WledDiscovery::Browsing(Box::new(FixedWledBrowser(vec![WledNode {
+                name: "wled-kitchen".to_string(),
+                address: std::net::Ipv4Addr::new(10, 0, 0, 7),
+                port: 80,
+            }])));
+        let mut form = AddGroupForm::new();
+        form.sync_options(&patchers);
+        state.mode = PanelMode::AddGroup(form);
+
+        let mut harness = Harness::new_ui(|ui| {
+            PatchPanel {
+                ctx: GuiContext {
+                    modal: &mut modal,
+                    client: &client,
+                },
+                state: &mut state,
+                snapshot: &snapshot,
+                patchers: &patchers,
+            }
+            .ui(ui);
+        });
+        harness.run();
+        harness.get_by_label("Discovered").click();
+        harness.run();
+        harness.get_by_label("wled-kitchen (10.0.0.7)").click();
+        harness.run();
+        drop(harness);
+
+        let PanelMode::AddGroup(form) = &state.mode else {
+            panic!("expected the add-group form to stay open");
+        };
+        assert_eq!(
+            form.group_options,
+            vec![("url".to_string(), "http://10.0.0.7/".to_string())]
         );
     }
 

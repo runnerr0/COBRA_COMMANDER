@@ -4,6 +4,7 @@ use eframe::egui;
 
 use crate::config::Options;
 use crate::fixture::patch::PatchOption;
+use crate::wled::discovery::WledNode;
 use gui_common::STATUS_COLORS;
 
 use super::address_map::{AddressMap, GroupName};
@@ -17,7 +18,7 @@ pub fn default_for_option(opt: &PatchOption) -> String {
         PatchOption::Bipolar => "0".to_string(),
         PatchOption::Unipolar => "1".to_string(),
         PatchOption::Select(choices) => choices.first().cloned().unwrap_or_default(),
-        PatchOption::Url => String::new(),
+        PatchOption::Url | PatchOption::WledUrl => String::new(),
         PatchOption::SocketAddr => String::new(),
         PatchOption::Optional(_) => String::new(),
     }
@@ -54,7 +55,7 @@ pub fn validate_option(opt: &PatchOption, value: &str) -> Result<(), String> {
                 Err("must be between 0 and 1".to_string())
             }
         }
-        PatchOption::Url => url::Url::parse(value)
+        PatchOption::Url | PatchOption::WledUrl => url::Url::parse(value)
             .map(|_| ())
             .map_err(|e| format!("invalid URL: {e}")),
         PatchOption::SocketAddr => value
@@ -71,7 +72,25 @@ pub fn validate_option(opt: &PatchOption, value: &str) -> Result<(), String> {
     }
 }
 
-pub fn render_option_widget(ui: &mut egui::Ui, key: &str, opt: &PatchOption, value: &mut String) {
+/// Whether any option in `menu` offers the WLED nodes found on the network.
+pub fn offers_wled_nodes(menu: &[(String, PatchOption)]) -> bool {
+    menu.iter().any(|(_, opt)| match opt {
+        PatchOption::WledUrl => true,
+        PatchOption::Optional(inner) => matches!(inner.as_ref(), PatchOption::WledUrl),
+        _ => false,
+    })
+}
+
+/// Render the editor for one option.
+///
+/// `wled_nodes` are the nodes a [`PatchOption::WledUrl`] offers to pick from.
+pub fn render_option_widget(
+    ui: &mut egui::Ui,
+    key: &str,
+    opt: &PatchOption,
+    value: &mut String,
+    wled_nodes: &[WledNode],
+) {
     let key_with_colon = format!("{key}:");
     match opt {
         PatchOption::Bool => {
@@ -103,6 +122,29 @@ pub fn render_option_widget(ui: &mut egui::Ui, key: &str, opt: &PatchOption, val
                 ui.text_edit_singleline(value);
             });
         }
+        PatchOption::WledUrl => {
+            ui.horizontal(|ui| {
+                ui.label(&key_with_colon);
+                ui.text_edit_singleline(value);
+                ui.menu_button("Discovered", |ui| {
+                    if wled_nodes.is_empty() {
+                        ui.label("No WLED nodes found.");
+                    }
+                    for node in wled_nodes {
+                        let Some(url) = node.url() else {
+                            continue;
+                        };
+                        if ui
+                            .button(format!("{} ({})", node.name, node.address))
+                            .clicked()
+                        {
+                            *value = url.to_string();
+                            ui.close();
+                        }
+                    }
+                });
+            });
+        }
         PatchOption::Optional(inner) => match inner.as_ref() {
             PatchOption::Select(choices) => {
                 ui.horizontal(|ui| {
@@ -121,7 +163,7 @@ pub fn render_option_widget(ui: &mut egui::Ui, key: &str, opt: &PatchOption, val
                         });
                 });
             }
-            other => render_option_widget(ui, key, other, value),
+            other => render_option_widget(ui, key, other, value, wled_nodes),
         },
     }
 }
