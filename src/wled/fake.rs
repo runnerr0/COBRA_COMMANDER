@@ -212,8 +212,9 @@ fn serve_http(
     {
         ("500 Internal Server Error", String::new())
     } else if request_line.starts_with("GET /json/info") {
-        let info =
-            format!(r#"{{"ver":"0.15.0","leds":{{"count":{LED_COUNT}}},"udpport":{udp_port}}}"#);
+        let info = format!(
+            r#"{{"ver":"0.15.0","leds":{{"count":{LED_COUNT},"rgbw":true}},"udpport":{udp_port}}}"#
+        );
         ("200 OK", info)
     } else if request_line.starts_with("GET /presets.json") {
         let presets = r#"{"0":{},"1":{"n":"Warm"},"3":{"n":"Chase"}}"#;

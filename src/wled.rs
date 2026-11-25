@@ -712,6 +712,7 @@ mod tests {
             udp_port: fake.udp_port,
             led_count: Some(1),
             preset_count: None,
+            rgbw: false,
         };
         let mut port = WledPixelPort::for_node(&node, 1).remove(0);
         port.open().unwrap();

@@ -2009,6 +2009,7 @@ mod test {
             udp_port: DEFAULT_UDP_PORT,
             led_count: Some(300),
             preset_count: Some(7),
+            rgbw: false,
         }]));
         let mut form = AddGroupForm::new();
         form.sync_options(&patchers);

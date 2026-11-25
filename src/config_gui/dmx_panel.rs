@@ -30,6 +30,8 @@ pub struct DmxPortPanelState {
     scan_wled: bool,
     /// Editable buffer for how many LEDs each pixel of a WLED port lights.
     wled_leds_per_pixel: String,
+    /// Whether WLED ports carry a white channel for each pixel.
+    wled_white: bool,
     wled_discovery: WledDiscovery,
     /// Selected port in the available list. None = "offline" selected.
     selected_port: Option<usize>,
@@ -52,6 +54,7 @@ impl DmxPortPanelState {
             artnet_timeout_secs: "3".to_string(),
             scan_wled: false,
             wled_leds_per_pixel: "1".to_string(),
+            wled_white: false,
             wled_discovery,
             selected_port: None,
             universes: Vec::new(),
@@ -120,6 +123,10 @@ impl DmxPortPanel<'_> {
                 if !wled_valid {
                     ui.colored_label(STATUS_COLORS.error_text, "must be a number from 1 up");
                 }
+                ui.checkbox(&mut self.state.wled_white, "White channel")
+                    .on_hover_text(
+                        "Give each pixel four DMX channels, the fourth driving the white LED of an RGBW strip.",
+                    );
             }
         });
 
@@ -324,7 +331,12 @@ impl DmxPortPanel<'_> {
                     && let Some(leds_per_pixel) = self.wled_leds_per_pixel()
                 {
                     for node in self.state.wled_discovery.nodes() {
-                        for port in WledPixelPort::for_node(&node, leds_per_pixel.get()) {
+                        let node_ports = if self.state.wled_white {
+                            WledPixelPort::for_rgbw_node(&node, leds_per_pixel.get())
+                        } else {
+                            WledPixelPort::for_node(&node, leds_per_pixel.get())
+                        };
+                        for port in node_ports {
                             ports.push(Box::new(port));
                         }
                     }
@@ -376,6 +388,7 @@ mod test {
                 udp_port: DEFAULT_UDP_PORT,
                 led_count: Some(300),
                 preset_count: None,
+                rgbw: false,
             }]),
         ));
         let debug_open = debug_open();
@@ -410,6 +423,64 @@ mod test {
             [
                 "WLED wled-kitchen at 10.0.0.7 LEDs 1-170",
                 "WLED wled-kitchen at 10.0.0.7 LEDs 171-300",
+            ]
+        );
+    }
+
+    /// With "White channel" checked as well, the ports listed carry four
+    /// channels a pixel.
+    #[test]
+    fn refresh_lists_rgbw_wled_pixel_ports() {
+        use crate::wled::discovery::{DEFAULT_UDP_PORT, WledNode, mock::FixedWledBrowser};
+
+        let client = auto_respond_client();
+        let status = DmxPortStatus { ports: vec![] };
+        let mut modal = MessageModal::default();
+        let mut state = DmxPortPanelState::with_wled_discovery(WledDiscovery::with_browser(
+            FixedWledBrowser(vec![WledNode {
+                name: "wled-kitchen".to_string(),
+                address: std::net::Ipv4Addr::new(10, 0, 0, 7),
+                port: 80,
+                udp_port: DEFAULT_UDP_PORT,
+                led_count: Some(200),
+                preset_count: None,
+                rgbw: true,
+            }]),
+        ));
+        let debug_open = debug_open();
+
+        let mut harness = Harness::new_ui(|ui| {
+            DmxPortPanel {
+                ctx: GuiContext {
+                    modal: &mut modal,
+                    client: &client,
+                },
+                state: &mut state,
+                port_status: &status,
+                debug_open: &debug_open,
+            }
+            .ui(ui);
+        });
+        harness.run();
+        harness.get_by_label("Scan WLED").click();
+        harness.run();
+        harness.get_by_label("White channel").click();
+        harness.run();
+        harness.get_by_label("Refresh").click();
+        harness.run();
+        drop(harness);
+
+        let wled_ports: Vec<String> = state
+            .available_ports
+            .iter()
+            .map(ToString::to_string)
+            .filter(|name| name.starts_with("WLED"))
+            .collect();
+        assert_eq!(
+            wled_ports,
+            [
+                "WLED wled-kitchen at 10.0.0.7 LEDs 1-128, RGBW",
+                "WLED wled-kitchen at 10.0.0.7 LEDs 129-200, RGBW",
             ]
         );
     }

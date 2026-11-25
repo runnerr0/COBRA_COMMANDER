@@ -39,6 +39,8 @@ pub struct WledNode {
     /// The highest-numbered preset saved on the node, if it has told us.
     /// This is the preset count to patch a WLED group with.
     pub preset_count: Option<u8>,
+    /// Whether the node's LEDs have a white channel.
+    pub rgbw: bool,
 }
 
 impl WledNode {
@@ -57,6 +59,7 @@ impl WledNode {
             udp_port: DEFAULT_UDP_PORT,
             led_count: None,
             preset_count: None,
+            rgbw: false,
         })
     }
 
@@ -65,6 +68,9 @@ impl WledNode {
         let mut summary = format!("{} ({})", self.name, self.address);
         if let Some(led_count) = self.led_count {
             summary.push_str(&format!(", {led_count} LEDs"));
+        }
+        if self.rgbw {
+            summary.push_str(", RGBW");
         }
         if let Some(preset_count) = self.preset_count {
             summary.push_str(&format!(", {preset_count} presets"));
@@ -90,7 +96,10 @@ impl WledNode {
             Ok(()) => {
                 if let Some(info) = wled.info.take() {
                     self.udp_port = info.udpport.unwrap_or(self.udp_port);
-                    self.led_count = info.leds.and_then(|leds| leds.count);
+                    if let Some(leds) = info.leds {
+                        self.led_count = leds.count;
+                        self.rgbw = leds.rgbw.unwrap_or(false);
+                    }
                 }
             }
             Err(err) => debug!("WLED node {} did not describe itself: {err}", self.name),
@@ -297,6 +306,7 @@ mod tests {
             udp_port: DEFAULT_UDP_PORT,
             led_count: None,
             preset_count: None,
+            rgbw: false,
         };
         assert_eq!(node.url().unwrap().as_str(), "http://10.0.0.7/");
     }
@@ -310,6 +320,7 @@ mod tests {
             udp_port: DEFAULT_UDP_PORT,
             led_count: None,
             preset_count: None,
+            rgbw: false,
         };
         assert_eq!(node.summary(), "wled-kitchen (10.0.0.7)");
 
@@ -318,6 +329,12 @@ mod tests {
         assert_eq!(
             node.summary(),
             "wled-kitchen (10.0.0.7), 300 LEDs, 7 presets"
+        );
+
+        node.rgbw = true;
+        assert_eq!(
+            node.summary(),
+            "wled-kitchen (10.0.0.7), 300 LEDs, RGBW, 7 presets"
         );
     }
 
@@ -364,6 +381,7 @@ mod tests {
         assert_eq!(node.port, fake.port);
         assert_eq!(node.udp_port, fake.udp_port);
         assert_eq!(node.led_count, Some(fake::LED_COUNT));
+        assert!(node.rgbw);
         assert_eq!(node.preset_count, Some(fake::PRESET_COUNT));
 
         advertiser.shutdown().unwrap();

@@ -20,17 +20,29 @@ use super::discovery::WledNode;
 /// How many RGB pixels fit in one DMX universe.
 pub const PIXELS_PER_UNIVERSE: u16 = 170;
 
+/// How many RGBW pixels fit in one DMX universe.
+pub const RGBW_PIXELS_PER_UNIVERSE: u16 = 128;
+
 /// The first byte of a DNRGB packet: RGB pixels from a given start index.
 const PROTOCOL_DNRGB: u8 = 4;
 
-/// The most LEDs WLED accepts in one DNRGB packet.
-const MAX_LEDS_PER_PACKET: usize = 489;
+/// The first byte of a DNRGBW packet: RGBW pixels from a given start index.
+const PROTOCOL_DNRGBW: u8 = 5;
+
+/// The largest realtime packet WLED accepts.
+const MAX_PACKET_LEN: usize = 1472;
+
+/// The bytes of a packet that come before its pixels.
+const HEADER_LEN: usize = 4;
 
 /// A timeout of zero makes WLED leave realtime mode at once.
 const RELEASE: [u8; 2] = [PROTOCOL_DNRGB, 0];
 
 /// An RGB colour for one LED.
 pub type Pixel = [u8; 3];
+
+/// An RGBW colour for one LED.
+pub type WhitePixel = [u8; 4];
 
 /// A connection for showing pixels on a WLED node.
 #[derive(Debug)]
@@ -65,15 +77,37 @@ impl Realtime {
         first_led: u16,
         pixels: impl IntoIterator<Item = Pixel>,
     ) -> io::Result<()> {
+        self.send_run(PROTOCOL_DNRGB, first_led, pixels)
+    }
+
+    /// Show `pixels` on consecutive LEDs that have a white channel, starting
+    /// from `first_led`.
+    pub fn show_rgbw(
+        &mut self,
+        first_led: u16,
+        pixels: impl IntoIterator<Item = WhitePixel>,
+    ) -> io::Result<()> {
+        self.send_run(PROTOCOL_DNRGBW, first_led, pixels)
+    }
+
+    /// Send a run of pixels of `N` channels each, in as many packets as it
+    /// takes.
+    fn send_run<const N: usize>(
+        &mut self,
+        protocol: u8,
+        first_led: u16,
+        pixels: impl IntoIterator<Item = [u8; N]>,
+    ) -> io::Result<()> {
+        let leds_per_packet = ((MAX_PACKET_LEN - HEADER_LEN) / N.max(1)).max(1);
         let mut pixels = pixels.into_iter().peekable();
         let mut first_led = first_led;
         while pixels.peek().is_some() {
             let [first_hi, first_lo] = first_led.to_be_bytes();
             self.packet.clear();
             self.packet
-                .extend([PROTOCOL_DNRGB, self.timeout_secs, first_hi, first_lo]);
+                .extend([protocol, self.timeout_secs, first_hi, first_lo]);
             let mut led_count: u16 = 0;
-            for pixel in pixels.by_ref().take(MAX_LEDS_PER_PACKET) {
+            for pixel in pixels.by_ref().take(leds_per_packet) {
                 self.packet.extend(pixel);
                 led_count += 1;
             }
@@ -166,6 +200,23 @@ fn first_of_a_run(failed: &mut Option<Instant>, now: Instant) -> bool {
     !recently
 }
 
+/// The colour of each of `led_count` LEDs, given a DMX frame of pixels of `N`
+/// channels that each light `leds_per_pixel` LEDs.
+///
+/// A frame shorter than the universe leaves the remaining LEDs black.
+fn led_colours<const N: usize>(
+    frame: &[u8],
+    leds_per_pixel: u16,
+    led_count: u16,
+) -> impl Iterator<Item = [u8; N]> {
+    frame
+        .chunks_exact(N.max(1))
+        .filter_map(|pixel| <[u8; N]>::try_from(pixel).ok())
+        .chain(std::iter::repeat([0; N]))
+        .flat_map(move |pixel| std::iter::repeat_n(pixel, usize::from(leds_per_pixel)))
+        .take(usize::from(led_count))
+}
+
 fn one_led_per_pixel() -> u16 {
     1
 }
@@ -173,7 +224,8 @@ fn one_led_per_pixel() -> u16 {
 /// A run of a WLED node's LEDs, as a DMX port.
 ///
 /// Each pixel takes three consecutive DMX channels, red, green then blue,
-/// starting from channel 1, and lights `leds_per_pixel` consecutive LEDs.
+/// starting from channel 1, and lights `leds_per_pixel` consecutive LEDs. A
+/// port with a white channel takes four, white last.
 #[derive(Serialize, Deserialize)]
 pub struct WledPixelPort {
     /// The name of the node, for display.
@@ -185,6 +237,9 @@ pub struct WledPixelPort {
     led_count: u16,
     #[serde(default = "one_led_per_pixel")]
     leds_per_pixel: u16,
+    /// Whether each pixel carries a white channel after its blue.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    white: bool,
     #[serde(skip)]
     realtime: Option<Realtime>,
     /// Whether the node is showing our pixels, as far as we know.
@@ -201,8 +256,23 @@ impl WledPixelPort {
     ///
     /// A node that has not reported its LED count gets one full universe.
     pub fn for_node(node: &WledNode, leds_per_pixel: u16) -> Vec<Self> {
+        Self::covering(node, leds_per_pixel, false)
+    }
+
+    /// As [`Self::for_node`], for LEDs with a white channel: each pixel takes
+    /// four DMX channels, so fewer fit in a universe.
+    pub fn for_rgbw_node(node: &WledNode, leds_per_pixel: u16) -> Vec<Self> {
+        Self::covering(node, leds_per_pixel, true)
+    }
+
+    fn covering(node: &WledNode, leds_per_pixel: u16, white: bool) -> Vec<Self> {
         let leds_per_pixel = leds_per_pixel.max(1);
-        let leds_per_universe = PIXELS_PER_UNIVERSE.saturating_mul(leds_per_pixel);
+        let pixels_per_universe = if white {
+            RGBW_PIXELS_PER_UNIVERSE
+        } else {
+            PIXELS_PER_UNIVERSE
+        };
+        let leds_per_universe = pixels_per_universe.saturating_mul(leds_per_pixel);
         let total = node.led_count.unwrap_or(leds_per_universe);
         (0..total)
             .step_by(usize::from(leds_per_universe))
@@ -213,6 +283,7 @@ impl WledPixelPort {
                 first_led,
                 led_count: (total - first_led).min(leds_per_universe),
                 leds_per_pixel,
+                white,
                 realtime: None,
                 showing: false,
                 failed: None,
@@ -240,6 +311,9 @@ impl fmt::Display for WledPixelPort {
         )?;
         if self.leds_per_pixel > 1 {
             write!(f, ", {} per pixel", self.leds_per_pixel)?;
+        }
+        if self.white {
+            write!(f, ", RGBW")?;
         }
         Ok(())
     }
@@ -282,14 +356,14 @@ impl DmxPort for WledPixelPort {
             return Ok(());
         }
         self.showing = true;
-        // A frame shorter than the universe leaves the remaining LEDs black.
-        let pixels = frame
-            .chunks_exact(3)
-            .filter_map(|rgb| Pixel::try_from(rgb).ok())
-            .chain(std::iter::repeat([0; 3]))
-            .flat_map(|pixel| std::iter::repeat_n(pixel, usize::from(self.leds_per_pixel)))
-            .take(usize::from(self.led_count));
-        let Err(err) = realtime.show(self.first_led, pixels) else {
+        let sent = if self.white {
+            let pixels = led_colours(frame, self.leds_per_pixel, self.led_count);
+            realtime.show_rgbw(self.first_led, pixels)
+        } else {
+            let pixels = led_colours(frame, self.leds_per_pixel, self.led_count);
+            realtime.show(self.first_led, pixels)
+        };
+        let Err(err) = sent else {
             return Ok(());
         };
         // A node that is switched off fails every frame, or every other one.
@@ -331,6 +405,7 @@ mod tests {
             udp_port: socket.local_addr().unwrap().port(),
             led_count,
             preset_count: None,
+            rgbw: false,
         };
         (socket, node)
     }
@@ -349,6 +424,7 @@ mod tests {
             udp_port: DEFAULT_UDP_PORT,
             led_count,
             preset_count: None,
+            rgbw: false,
         }
     }
 
@@ -510,6 +586,70 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(failures, 1);
+    }
+
+    /// LEDs with a white channel take four DMX channels each, so fewer fit
+    /// in a universe.
+    #[test]
+    fn rgbw_ports_hold_fewer_pixels() {
+        let names: Vec<String> = WledPixelPort::for_rgbw_node(&node(Some(300)), 1)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "WLED wled-kitchen at 10.0.0.7 LEDs 1-128, RGBW",
+                "WLED wled-kitchen at 10.0.0.7 LEDs 129-256, RGBW",
+                "WLED wled-kitchen at 10.0.0.7 LEDs 257-300, RGBW",
+            ]
+        );
+    }
+
+    /// An RGBW port sends four channels a pixel in WLED's DNRGBW format.
+    #[test]
+    fn rgbw_port_sends_the_white_channel() {
+        let (socket, node) = listening_node(Some(3));
+        let mut port = WledPixelPort::for_rgbw_node(&node, 1).remove(0);
+        port.open().unwrap();
+        // The third pixel is missing from the frame and stays black.
+        port.write(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        assert_eq!(
+            receive(&socket),
+            [5, 2, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0]
+        );
+    }
+
+    /// A long RGBW run is split so that no packet exceeds what WLED accepts.
+    #[test]
+    fn long_rgbw_run_is_split_across_packets() {
+        let (socket, node) = listening_node(Some(1));
+        let mut realtime = Realtime::connect(socket.local_addr().unwrap(), 1).unwrap();
+        realtime
+            .show_rgbw(0, std::iter::repeat_n([7; 4], 400))
+            .unwrap();
+        let first = receive(&socket);
+        assert_eq!(first.len(), 4 + 367 * 4);
+        assert_eq!(first[..4], [5, 1, 0, 0]);
+        let second = receive(&socket);
+        assert_eq!(second.len(), 4 + 33 * 4);
+        // The second packet starts where the first ended: LED 367.
+        assert_eq!(second[..4], [5, 1, 1, 111]);
+        drop(node);
+    }
+
+    /// A port saved before RGBW ports existed loads as an RGB port, and an
+    /// RGBW port keeps its white channel through a show file.
+    #[test]
+    fn rgbw_port_survives_a_round_trip_through_a_show_file() {
+        let port: Box<dyn DmxPort> =
+            Box::new(WledPixelPort::for_rgbw_node(&node(Some(2)), 1).remove(0));
+        let saved = serde_yaml::to_string(&port).unwrap();
+        let loaded: Box<dyn DmxPort> = serde_yaml::from_str(&saved).unwrap();
+        assert_eq!(loaded.to_string(), port.to_string());
+
+        let rgb: Box<dyn DmxPort> = Box::new(WledPixelPort::for_node(&node(Some(2)), 1).remove(0));
+        assert!(!serde_yaml::to_string(&rgb).unwrap().contains("white"));
     }
 
     /// Failures that keep coming are reported once; one that follows a long
