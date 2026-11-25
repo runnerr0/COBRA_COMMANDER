@@ -14,17 +14,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 use reqwest::Url;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use wled_json_api_library::{
     structures::state::{Seg, State},
     wled::Wled,
 };
 
 use crate::worker::Shutdown;
-use discovery::DEFAULT_UDP_PORT;
+use discovery::{DEFAULT_UDP_PORT, WledDiscovery};
 use pixels::Realtime;
 use socket::StateSocket;
 
@@ -76,6 +76,46 @@ const FLASH_TIMEOUT_SECS: u8 = 1;
 #[serde(transparent)]
 pub struct WledUrl(pub Url);
 
+/// The hardware address of a WLED node, which stays the same when the
+/// network gives the node a different IP address.
+///
+/// Held as WLED reports it: twelve lowercase hex digits.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct WledMac(String);
+
+impl WledMac {
+    /// Read a hardware address, with or without separators, in either case.
+    pub fn parse(mac: &str) -> Option<Self> {
+        let digits: String = mac
+            .chars()
+            .filter(|c| !matches!(c, ':' | '-' | '.') && !c.is_whitespace())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        (digits.len() == 12 && digits.chars().all(|c| c.is_ascii_hexdigit()))
+            .then_some(Self(digits))
+    }
+}
+
+impl TryFrom<String> for WledMac {
+    type Error = String;
+    fn try_from(mac: String) -> std::result::Result<Self, Self::Error> {
+        Self::parse(&mac).ok_or_else(|| format!("\"{mac}\" is not a hardware address"))
+    }
+}
+
+impl From<WledMac> for String {
+    fn from(mac: WledMac) -> Self {
+        mac.0
+    }
+}
+
+impl std::fmt::Display for WledMac {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// How many presets a WLED node has: the highest-numbered one saved on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
@@ -125,17 +165,41 @@ impl PresetNames {
 }
 
 impl WledController {
-    /// Run a thread to handle sending WLED control messages.
+    /// As [`Self::run_node`], for a node known only by its address.
+    #[cfg(test)]
+    pub fn run(url: Url) -> Self {
+        Self::run_node(url, None)
+    }
+
+    /// Run a thread to handle sending WLED control messages to the node at
+    /// `url`, whose hardware address is `mac` if that is known.
     ///
     /// Polls once every 5 seconds for initial configuration until the client
     /// responds.
-    pub fn run(url: Url) -> Self {
-        Self::run_retrying_every(url, CONNECT_RETRY_INTERVAL)
+    ///
+    /// A network may give a node a different address from one day to the
+    /// next, and the address it had to another node. If the node at `url` is
+    /// absent or is not the one `mac` names, the node is looked for on the
+    /// network and used wherever it is found.
+    pub fn run_node(url: Url, mac: Option<WledMac>) -> Self {
+        Self::run_with(url, mac, discovery::shared(), CONNECT_RETRY_INTERVAL)
     }
 
     /// As [`Self::run`], waiting `retry_interval` between attempts to reach
     /// the node.
+    #[cfg(test)]
     fn run_retrying_every(url: Url, retry_interval: Duration) -> Self {
+        Self::run_with(url, None, WledDiscovery::default(), retry_interval)
+    }
+
+    /// As [`Self::run_node`], looking for a node that has moved with
+    /// `discovery` and waiting `retry_interval` between attempts to reach it.
+    fn run_with(
+        url: Url,
+        mac: Option<WledMac>,
+        discovery: WledDiscovery,
+        retry_interval: Duration,
+    ) -> Self {
         let outbox = Arc::new(Outbox::default());
         let flasher = Arc::new(Mutex::new(None));
         let pixels_allowed = Arc::new(AtomicBool::new(true));
@@ -147,9 +211,18 @@ impl WledController {
         let sender_outbox = outbox.clone();
         let sender_url = url.clone();
         crate::worker::spawn("wled-send", move |shutdown| {
-            let Some(mut wled) = initialize(&sender_url, retry_interval, &shutdown) else {
+            let Some(mut wled) = initialize(
+                &sender_url,
+                mac.as_ref(),
+                &discovery,
+                retry_interval,
+                &shutdown,
+            ) else {
                 return;
             };
+            // Where the node was found, which may not be where it was saved.
+            let mut sender_url = wled.url.clone();
+            sender_url.set_path("");
             // Until this succeeds the node can neither flash nor have its
             // pixel ports held, so keep trying while there is nothing to send.
             let connect_flasher = |wled: &mut Wled, complain: bool| match Flasher::connect(wled) {
@@ -807,21 +880,66 @@ fn has_content(state: &State) -> bool {
 /// Poll the WLED API until we get a good config back.
 ///
 /// Return None if shutdown is triggered first.
-fn initialize(url: &Url, poll_interval: Duration, shutdown: &Shutdown) -> Option<Wled> {
+///
+/// If the node at `url` is absent, or is not the one `mac` names, use the
+/// address `discovery` finds that node at.
+fn initialize(
+    url: &Url,
+    mac: Option<&WledMac>,
+    discovery: &WledDiscovery,
+    poll_interval: Duration,
+    shutdown: &Shutdown,
+) -> Option<Wled> {
     info!("Initializing WLED for {url}...");
     loop {
-        match Wled::try_from_url(url) {
+        match connect(url, mac) {
             Ok(wled) => {
                 info!("WLED client connection successful.");
                 return Some(wled);
             }
             Err(err) => {
-                warn!("Failed to initialize WLED at {url}: {err}");
+                warn!("Failed to initialize WLED at {url}: {err:#}");
+            }
+        }
+        let moved_to = mac
+            .and_then(|mac| discovery.find(mac))
+            .and_then(|node| node.url())
+            .filter(|found| found != url);
+        if let Some(found) = moved_to {
+            match connect(&found, mac) {
+                Ok(wled) => {
+                    info!("The WLED node saved at {url} is now at {found}; using that.");
+                    return Some(wled);
+                }
+                Err(err) => warn!("Failed to initialize WLED at {found}: {err:#}"),
             }
         }
         if shutdown.sleep_or_shutdown(poll_interval) {
             return None;
         }
+    }
+}
+
+/// Connect to the node at `url`, refusing a node other than the one `mac`
+/// names.
+fn connect(url: &Url, mac: Option<&WledMac>) -> Result<Wled> {
+    let mut wled = Wled::try_from_url(url).map_err(|err| anyhow!("{err}"))?;
+    let Some(mac) = mac else {
+        return Ok(wled);
+    };
+    wled.get_info_from_wled()
+        .map_err(|err| anyhow!("the node did not say which node it is: {err}"))?;
+    let answered = wled
+        .info
+        .as_ref()
+        .and_then(|info| info.mac.as_deref())
+        .and_then(WledMac::parse);
+    match answered {
+        Some(other) if other != *mac => {
+            bail!("a different node ({other}) has that address; looking for {mac}")
+        }
+        // Firmware too old to give its address cannot be told apart.
+        _ => Ok(wled),
     }
 }
 
@@ -872,6 +990,73 @@ mod tests {
             fake.next_realtime_packet(Duration::from_secs(5)),
             Some(vec![4, 0])
         );
+    }
+
+    /// An address nothing answers at.
+    fn dead_url() -> Url {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        Url::parse(&format!("http://127.0.0.1:{port}")).unwrap()
+    }
+
+    /// Discovery that knows only where `fake` is.
+    fn discovery_of(fake: &FakeWled) -> WledDiscovery {
+        WledDiscovery::with_browser(discovery::mock::FixedWledBrowser(vec![WledNode {
+            name: "fake".to_string(),
+            address: std::net::Ipv4Addr::LOCALHOST,
+            port: fake.port,
+            udp_port: fake.udp_port,
+            led_count: None,
+            preset_count: None,
+            rgbw: false,
+            mac: Some(fake.mac()),
+        }]))
+    }
+
+    /// A node the network has given a new address is found by its hardware
+    /// address, so a saved show still reaches it.
+    #[test]
+    fn node_that_changed_address_is_found_by_its_hardware_address() {
+        let fake = FakeWled::start();
+        let controller = WledController::run_with(
+            dead_url(),
+            Some(fake.mac()),
+            discovery_of(&fake),
+            Duration::from_millis(20),
+        );
+        controller.send(WledControlMessage::SetState(level(10)));
+        assert_eq!(fake.next_state().bri, Some(10));
+    }
+
+    /// The address a node used to have may now belong to another node, which
+    /// must not be sent what was meant for ours.
+    #[test]
+    fn another_node_at_the_saved_address_is_not_mistaken_for_ours() {
+        let stranger = FakeWled::start();
+        let fake = FakeWled::start();
+        let controller = WledController::run_with(
+            stranger.url.clone(),
+            Some(fake.mac()),
+            discovery_of(&fake),
+            Duration::from_millis(20),
+        );
+        controller.send(WledControlMessage::SetState(level(10)));
+        assert_eq!(fake.next_state().bri, Some(10));
+        assert!(stranger.posted_within(Duration::from_millis(200)).is_none());
+    }
+
+    /// A node still at its saved address is used without looking for it.
+    #[test]
+    fn node_at_its_saved_address_is_used_as_it_is() {
+        let fake = FakeWled::start();
+        let controller = WledController::run_with(
+            fake.url.clone(),
+            Some(fake.mac()),
+            WledDiscovery::default(),
+            Duration::from_millis(20),
+        );
+        controller.send(WledControlMessage::SetState(level(10)));
+        assert_eq!(fake.next_state().bri, Some(10));
     }
 
     /// The controller learns the names the node gives its presets.
@@ -927,6 +1112,7 @@ mod tests {
             led_count: Some(1),
             preset_count: None,
             rgbw: false,
+            mac: None,
         };
         let mut port = WledPixelPort::for_node(&node, 1).remove(0);
         port.open().unwrap();

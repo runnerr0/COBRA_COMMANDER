@@ -12,10 +12,14 @@ use std::{
 };
 
 use anyhow::Context;
+use log::{info, warn};
 use rust_dmx::{DmxPort, OpenError, WriteError};
 use serde::{Deserialize, Serialize};
 
-use super::discovery::WledNode;
+use super::{
+    WledMac,
+    discovery::{self, WledDiscovery, WledNode},
+};
 
 /// How many RGB pixels fit in one DMX universe.
 pub const PIXELS_PER_UNIVERSE: u16 = 170;
@@ -194,6 +198,9 @@ fn unclaim(node: SocketAddr) {
 /// releasing it.
 const PORT_TIMEOUT_SECS: u8 = 2;
 
+/// How often a port checks whether its node has been given another address.
+const RELOCATE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// How long a port must go without a failed send before it reports one again.
 const FAILURE_QUIET_PERIOD: Duration = Duration::from_secs(10);
 
@@ -248,6 +255,13 @@ pub struct WledPixelPort {
     /// Whether each pixel carries a white channel after its blue.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     white: bool,
+    /// The node's hardware address. With it the port follows the node when
+    /// the network gives it a different IP address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mac: Option<WledMac>,
+    /// When the port last checked where its node is.
+    #[serde(skip)]
+    located: Option<Instant>,
     #[serde(skip)]
     realtime: Option<Realtime>,
     /// Whether the node is showing our pixels, as far as we know.
@@ -292,6 +306,8 @@ impl WledPixelPort {
                 led_count: (total - first_led).min(leds_per_universe),
                 leds_per_pixel,
                 white,
+                mac: node.mac.clone(),
+                located: None,
                 realtime: None,
                 showing: false,
                 failed: None,
@@ -302,6 +318,41 @@ impl WledPixelPort {
     /// The address the node takes realtime data on.
     fn node(&self) -> SocketAddr {
         (self.address, self.udp_port).into()
+    }
+
+    /// Follow the node to the address `discovery` finds it at, if that is
+    /// not where the port has been sending.
+    fn relocate(&mut self, discovery: &WledDiscovery) {
+        let Some(node) = self.mac.as_ref().and_then(|mac| discovery.find(mac)) else {
+            return;
+        };
+        if (node.address, node.udp_port) == (self.address, self.udp_port) {
+            return;
+        }
+        info!(
+            "WLED node {} has moved from {} to {}; following it.",
+            self.name, self.address, node.address
+        );
+        let was_open = self.realtime.is_some();
+        // Lets go of the node at the old address, which may be another node
+        // by now.
+        self.close();
+        self.address = node.address;
+        self.udp_port = node.udp_port;
+        if was_open && let Err(err) = self.connect() {
+            warn!(
+                "failed to open a UDP socket to WLED node {} at {}: {err}",
+                self.name, self.address
+            );
+        }
+    }
+
+    fn connect(&mut self) -> io::Result<()> {
+        self.realtime = Some(Realtime::connect(
+            (self.address, self.udp_port),
+            PORT_TIMEOUT_SECS,
+        )?);
+        Ok(())
     }
 }
 
@@ -333,9 +384,12 @@ impl DmxPort for WledPixelPort {
         if self.realtime.is_some() {
             return Ok(());
         }
-        let realtime = Realtime::connect((self.address, self.udp_port), PORT_TIMEOUT_SECS)
+        if self.mac.is_some() {
+            self.located = Some(Instant::now());
+            self.relocate(&discovery::shared());
+        }
+        self.connect()
             .context("failed to open a UDP socket to the WLED node")?;
-        self.realtime = Some(realtime);
         Ok(())
     }
 
@@ -348,6 +402,14 @@ impl DmxPort for WledPixelPort {
     }
 
     fn write(&mut self, frame: &[u8]) -> Result<(), WriteError> {
+        if self.mac.is_some()
+            && self
+                .located
+                .is_none_or(|at| at.elapsed() >= RELOCATE_INTERVAL)
+        {
+            self.located = Some(Instant::now());
+            self.relocate(&discovery::shared());
+        }
         let node = self.node();
         let Some(realtime) = &mut self.realtime else {
             return Err(WriteError::Disconnected);
@@ -414,6 +476,7 @@ mod tests {
             led_count,
             preset_count: None,
             rgbw: false,
+            mac: None,
         };
         (socket, node)
     }
@@ -433,6 +496,7 @@ mod tests {
             led_count,
             preset_count: None,
             rgbw: false,
+            mac: None,
         }
     }
 
@@ -565,6 +629,46 @@ mod tests {
         hold_pixels(port.node(), false);
         port.write(&[4, 5, 6]).unwrap();
         assert_eq!(receive(&socket), [4, 2, 0, 0, 4, 5, 6, 0]);
+    }
+
+    /// A port saved with its node's hardware address follows the node to a
+    /// new address, and goes on sending without being reopened.
+    #[test]
+    fn port_follows_its_node_to_a_new_address() {
+        let (socket, mut node) = listening_node(Some(2));
+        node.mac = WledMac::parse("a842e38d9828");
+        let (old_socket, old_node) = listening_node(Some(2));
+        let mut saved = node.clone();
+        saved.udp_port = old_node.udp_port;
+        let mut port = WledPixelPort::for_node(&saved, 1).remove(0);
+        // Opened by hand: `open` asks the app's own discovery.
+        port.connect().unwrap();
+        port.write(&[1, 2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(receive(&old_socket), [4, 2, 0, 0, 1, 2, 3, 4, 5, 6]);
+
+        let discovery =
+            WledDiscovery::with_browser(discovery::mock::FixedWledBrowser(vec![node.clone()]));
+        port.relocate(&discovery);
+        // The old address is let go, in case another node has it now.
+        assert_eq!(receive(&old_socket), [4, 0]);
+        port.write(&[1, 2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(receive(&socket), [4, 2, 0, 0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    /// A port saved before ports carried a hardware address still loads, and
+    /// one that has an address keeps it when saved.
+    #[test]
+    fn hardware_address_is_saved_only_when_known() {
+        let mut node = node(Some(2));
+        let port = WledPixelPort::for_node(&node, 1).remove(0);
+        assert!(!serde_yaml::to_string(&port).unwrap().contains("mac"));
+
+        node.mac = WledMac::parse("a842e38d9828");
+        let port = WledPixelPort::for_node(&node, 1).remove(0);
+        let saved = serde_yaml::to_string(&port).unwrap();
+        assert!(saved.contains("mac: a842e38d9828"), "{saved}");
+        let loaded: WledPixelPort = serde_yaml::from_str(&saved).unwrap();
+        assert_eq!(loaded.mac, node.mac);
     }
 
     #[test]

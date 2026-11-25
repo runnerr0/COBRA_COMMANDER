@@ -5,7 +5,7 @@
 use std::{
     collections::BTreeMap,
     net::Ipv4Addr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -14,6 +14,8 @@ use log::{debug, warn};
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use reqwest::Url;
 use wled_json_api_library::wled::Wled;
+
+use super::WledMac;
 
 /// The mDNS service type WLED advertises.
 const SERVICE_TYPE: &str = "_wled._tcp.local.";
@@ -41,6 +43,9 @@ pub struct WledNode {
     pub preset_count: Option<u8>,
     /// Whether the node's LEDs have a white channel.
     pub rgbw: bool,
+    /// The node's hardware address, if it has told us. This is what
+    /// identifies the node when its IP address changes.
+    pub mac: Option<WledMac>,
 }
 
 impl WledNode {
@@ -60,6 +65,7 @@ impl WledNode {
             led_count: None,
             preset_count: None,
             rgbw: false,
+            mac: service.get_property_val_str("mac").and_then(WledMac::parse),
         })
     }
 
@@ -96,6 +102,11 @@ impl WledNode {
             Ok(()) => {
                 if let Some(info) = wled.info.take() {
                     self.udp_port = info.udpport.unwrap_or(self.udp_port);
+                    self.mac = info
+                        .mac
+                        .as_deref()
+                        .and_then(WledMac::parse)
+                        .or(self.mac.take());
                     if let Some(leds) = info.leds {
                         self.led_count = leds.count;
                         self.rgbw = leds.rgbw.unwrap_or(false);
@@ -236,6 +247,13 @@ impl Drop for MdnsWledBrowser {
     }
 }
 
+/// The one handle the whole app shares, so that there is one browser however
+/// many panels, fixtures and ports ask after nodes.
+pub fn shared() -> WledDiscovery {
+    static SHARED: OnceLock<WledDiscovery> = OnceLock::new();
+    SHARED.get_or_init(WledDiscovery::default).clone()
+}
+
 /// A shared handle on the WLED nodes on the network.
 ///
 /// Browsing starts only once something asks for the nodes, so a show with no
@@ -271,6 +289,13 @@ impl WledDiscovery {
             Browsing::Active(browser) => browser.nodes(),
             Browsing::Idle | Browsing::Unavailable => Vec::new(),
         }
+    }
+
+    /// The node with hardware address `mac`, if it is on the network.
+    pub fn find(&self, mac: &WledMac) -> Option<WledNode> {
+        self.nodes()
+            .into_iter()
+            .find(|node| node.mac.as_ref() == Some(mac))
     }
 
     /// Discovery that reports the nodes of `browser`.
@@ -326,6 +351,7 @@ mod tests {
             led_count: None,
             preset_count: None,
             rgbw: false,
+            mac: None,
         };
         assert_eq!(node.url().unwrap().as_str(), "http://10.0.0.7/");
     }
@@ -340,6 +366,7 @@ mod tests {
             led_count: None,
             preset_count: None,
             rgbw: false,
+            mac: None,
         };
         assert_eq!(node.summary(), "wled-kitchen (10.0.0.7)");
 
@@ -372,6 +399,37 @@ mod tests {
             vec![(1, "Warm".to_string()), (3, "Chase".to_string())]
         );
         assert_eq!(preset_names("not json"), None);
+    }
+
+    #[test]
+    fn discovery_finds_a_node_by_its_hardware_address() {
+        let mac = WledMac::parse("A8:42:E3:8D:98:28").unwrap();
+        let node = WledNode {
+            name: "wled-kitchen".to_string(),
+            address: Ipv4Addr::new(10, 0, 0, 7),
+            port: 80,
+            udp_port: DEFAULT_UDP_PORT,
+            led_count: None,
+            preset_count: None,
+            rgbw: false,
+            mac: Some(mac.clone()),
+        };
+        let discovery = WledDiscovery::with_browser(mock::FixedWledBrowser(vec![node.clone()]));
+        assert_eq!(discovery.find(&mac), Some(node));
+        assert_eq!(
+            discovery.find(&WledMac::parse("000000000001").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn hardware_address_is_read_however_it_is_written() {
+        let mac = WledMac::parse("a842e38d9828");
+        assert!(mac.is_some());
+        assert_eq!(WledMac::parse("A8:42:E3:8D:98:28"), mac);
+        assert_eq!(WledMac::parse("a8-42-e3-8d-98-28"), mac);
+        assert_eq!(WledMac::parse("a842e38d98"), None);
+        assert_eq!(WledMac::parse("not a mac!!!"), None);
     }
 
     #[test]
@@ -412,6 +470,7 @@ mod tests {
         assert_eq!(node.udp_port, fake.udp_port);
         assert_eq!(node.led_count, Some(fake::LED_COUNT));
         assert!(node.rgbw);
+        assert_eq!(node.mac, Some(fake.mac()));
         assert_eq!(node.preset_count, Some(fake::PRESET_COUNT));
 
         // Withdraw the advertisement, or the name lingers on the network

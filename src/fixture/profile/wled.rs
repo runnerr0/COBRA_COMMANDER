@@ -6,7 +6,7 @@ use crate::{
     color::{Hsv, RenderColor},
     fixture::prelude::*,
     strobe::FlashState,
-    wled::{PresetNames, WledControlMessage, WledController, WledPresetCount, WledUrl},
+    wled::{PresetNames, WledControlMessage, WledController, WledMac, WledPresetCount, WledUrl},
 };
 use wled_json_api_library::structures::state::{Seg, State};
 
@@ -118,6 +118,9 @@ pub struct Wled {
 pub struct GroupOptions {
     pub url: WledUrl,
     pub preset_count: WledPresetCount,
+    /// The node's hardware address. With it the node is found again when
+    /// the network gives it a different IP address than `url` holds.
+    pub mac: Option<WledMac>,
 }
 
 impl PatchFixture for Wled {
@@ -126,7 +129,7 @@ impl PatchFixture for Wled {
     type PatchOptions = NoOptions;
 
     fn new(options: Self::GroupOptions) -> Self {
-        let controller = WledController::run(options.url.0);
+        let controller = WledController::run_node(options.url.0, options.mac);
         Self {
             level: Unipolar::new("Level", ()).with_channel_level(),
             speed: Unipolar::new("Speed", ()).with_channel_knob(0),

@@ -389,6 +389,7 @@ mod test {
                 led_count: Some(300),
                 preset_count: None,
                 rgbw: false,
+                mac: None,
             }]),
         ));
         let debug_open = debug_open();
@@ -445,6 +446,7 @@ mod test {
                 led_count: Some(200),
                 preset_count: None,
                 rgbw: true,
+                mac: None,
             }]),
         ));
         let debug_open = debug_open();

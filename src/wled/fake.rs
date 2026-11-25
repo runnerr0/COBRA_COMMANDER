@@ -14,6 +14,8 @@ use reqwest::Url;
 use tungstenite::Message;
 use wled_json_api_library::structures::state::State;
 
+use super::WledMac;
+
 /// The LED count the fake reports.
 pub const LED_COUNT: u16 = 300;
 
@@ -117,6 +119,11 @@ impl FakeWled {
         }
     }
 
+    /// The hardware address the fake reports. Each fake has its own.
+    pub fn mac(&self) -> WledMac {
+        WledMac::parse(&mac_for(self.port)).unwrap()
+    }
+
     /// Report LEDs with a white channel from now on.
     pub fn with_white_channel(self) -> Self {
         self.faults.white.store(true, Ordering::SeqCst);
@@ -177,6 +184,11 @@ impl FakeWled {
         let len = self.realtime.recv(&mut buf).ok()?;
         Some(buf[..len].to_vec())
     }
+}
+
+/// The hardware address of the fake listening on `port`.
+fn mac_for(port: u16) -> String {
+    format!("{port:012x}")
 }
 
 /// Serve one connection: a WebSocket for as long as it stays open, or a
@@ -268,9 +280,10 @@ fn serve_http(
         ("500 Internal Server Error", String::new())
     } else if request_line.starts_with("GET /json/info") {
         let info = format!(
-            r#"{{"ver":"0.15.0","leds":{{"count":{LED_COUNT},"rgbw":{}}},"udpport":{udp_port},"uptime":{}}}"#,
+            r#"{{"ver":"0.15.0","leds":{{"count":{LED_COUNT},"rgbw":{}}},"udpport":{udp_port},"uptime":{},"mac":"{}"}}"#,
             faults.white.load(Ordering::SeqCst),
-            faults.uptime()
+            faults.uptime(),
+            mac_for(stream.local_addr().unwrap().port())
         );
         ("200 OK", info)
     } else if request_line.starts_with("GET /presets.json") {

@@ -1997,6 +1997,10 @@ mod test {
                 vec![
                     ("url".into(), PatchOption::WledUrl),
                     ("preset_count".into(), PatchOption::WledPresetCount),
+                    (
+                        "mac".into(),
+                        PatchOption::Optional(Box::new(PatchOption::WledMac)),
+                    ),
                 ]
             },
             create_patch: |_, _| {
@@ -2009,10 +2013,10 @@ mod test {
         }
     }
 
-    /// Picking a discovered WLED node in the add-group form fills in its URL
-    /// and how many presets it has.
+    /// Picking a discovered WLED node in the add-group form fills in its URL,
+    /// how many presets it has and its hardware address.
     #[test]
-    fn picking_a_discovered_wled_node_fills_in_its_url_and_preset_count() {
+    fn picking_a_discovered_wled_node_fills_in_what_it_says_of_itself() {
         use crate::wled::discovery::{DEFAULT_UDP_PORT, WledNode, mock::FixedWledBrowser};
 
         let client = auto_respond_client();
@@ -2028,6 +2032,7 @@ mod test {
             led_count: Some(300),
             preset_count: Some(7),
             rgbw: false,
+            mac: crate::wled::WledMac::parse("A8:42:E3:8D:98:28"),
         }]));
         let mut form = AddGroupForm::new();
         form.sync_options(&patchers);
@@ -2062,6 +2067,7 @@ mod test {
             vec![
                 ("url".to_string(), "http://10.0.0.7/".to_string()),
                 ("preset_count".to_string(), "7".to_string()),
+                ("mac".to_string(), "a842e38d9828".to_string()),
             ]
         );
     }

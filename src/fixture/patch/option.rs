@@ -10,7 +10,7 @@ use url::Url;
 use crate::{
     config::Options,
     fixture::fixture::EnumRenderModel,
-    wled::{WledPresetCount, WledUrl},
+    wled::{WledMac, WledPresetCount, WledUrl},
 };
 /// A type that fixtures can use to declare that they do not accept patch options.
 #[derive(Deserialize)]
@@ -76,6 +76,12 @@ impl AsPatchOption for Url {
 impl AsPatchOption for WledUrl {
     fn as_patch_option() -> PatchOption {
         PatchOption::WledUrl
+    }
+}
+
+impl AsPatchOption for WledMac {
+    fn as_patch_option() -> PatchOption {
+        PatchOption::WledMac
     }
 }
 
@@ -187,6 +193,10 @@ pub enum PatchOption {
     /// How many presets a WLED node has, from 1 to 255. Filled in when a
     /// node is picked for a [`PatchOption::WledUrl`] in the same form.
     WledPresetCount,
+    /// The hardware address of a WLED node, by which it is found again if
+    /// its IP address changes. Filled in when a node is picked for a
+    /// [`PatchOption::WledUrl`] in the same form.
+    WledMac,
     /// A boolean option.
     Bool,
     /// A bipolar float in the range [-1, 1].
@@ -210,6 +220,7 @@ impl PatchOption {
             PatchOption::Unipolar => Value::Number(1.0.into()),
             PatchOption::Select(opts) => Value::String(opts[0].clone()),
             PatchOption::SocketAddr => Value::String("127.0.0.1:9999".into()),
+            PatchOption::WledMac => Value::String("a842e38d9828".into()),
             PatchOption::Url | PatchOption::WledUrl => {
                 Value::String("http://127.0.0.1:9999".into())
             }
@@ -228,6 +239,7 @@ impl Display for PatchOption {
             Self::Url => f.write_str("<url>"),
             Self::WledUrl => f.write_str("<WLED node url>"),
             Self::WledPresetCount => f.write_str("<preset count, 1..255>"),
+            Self::WledMac => f.write_str("<hardware address, 12 hex digits>"),
             Self::Bool => f.write_str("true, false"),
             Self::Bipolar => f.write_str("<bipolar float, -1..1>"),
             Self::Unipolar => f.write_str("<unipolar float, 0..1>"),

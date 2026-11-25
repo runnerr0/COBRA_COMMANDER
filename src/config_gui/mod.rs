@@ -46,7 +46,6 @@ use crate::midi::ControlHandler;
 use crate::preview::Previewer;
 use crate::show::Show;
 use crate::ui_util::GuiContext;
-use crate::wled::discovery::WledDiscovery;
 use audio_panel::AudioPanelState;
 use clock_panel::{ClockPanel, ClockPanelState};
 use dmx_panel::{DmxPortPanel, DmxPortPanelState};
@@ -560,7 +559,7 @@ pub fn run_console(log_rx: Receiver<LogRecord>) -> Result<()> {
             let audio_panel = AudioPanelState::new(devices);
 
             // One browser serves every panel that lists WLED nodes.
-            let wled_discovery = WledDiscovery::default();
+            let wled_discovery = crate::wled::discovery::shared();
             Ok(Box::new(ConsoleApp {
                 source_panel: ClockPanelState::new(&initial_clock_status),
                 audio_panel,

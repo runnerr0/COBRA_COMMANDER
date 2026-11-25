@@ -19,7 +19,7 @@ pub fn default_for_option(opt: &PatchOption) -> String {
         PatchOption::Unipolar => "1".to_string(),
         PatchOption::Select(choices) => choices.first().cloned().unwrap_or_default(),
         PatchOption::Url | PatchOption::WledUrl => String::new(),
-        PatchOption::SocketAddr => String::new(),
+        PatchOption::SocketAddr | PatchOption::WledMac => String::new(),
         PatchOption::Optional(_) => String::new(),
     }
 }
@@ -58,6 +58,9 @@ pub fn validate_option(opt: &PatchOption, value: &str) -> Result<(), String> {
         PatchOption::Url | PatchOption::WledUrl => url::Url::parse(value)
             .map(|_| ())
             .map_err(|e| format!("invalid URL: {e}")),
+        PatchOption::WledMac => crate::wled::WledMac::parse(value)
+            .map(|_| ())
+            .ok_or_else(|| "must be 12 hex digits, such as a842e38d9828".to_string()),
         PatchOption::SocketAddr => value
             .parse::<std::net::SocketAddr>()
             .map(|_| ())
@@ -119,6 +122,7 @@ pub fn render_option_widget(
         | PatchOption::Bipolar
         | PatchOption::Unipolar
         | PatchOption::Url
+        | PatchOption::WledMac
         | PatchOption::SocketAddr => {
             ui.horizontal(|ui| {
                 ui.label(&key_with_colon);
@@ -171,26 +175,32 @@ pub fn render_option_widget(
 }
 
 /// Fill in the options of a form that a picked WLED node can answer for
-/// itself, so that its preset count does not have to be copied by hand.
+/// itself, so that they do not have to be copied by hand.
 pub fn fill_from_wled_node(
     menu: &[(String, PatchOption)],
     entries: &mut [(String, String)],
     node: &WledNode,
 ) {
-    let Some(preset_count) = node.preset_count else {
-        return;
-    };
     for (key, opt) in menu {
-        let counts_presets = match opt {
-            PatchOption::WledPresetCount => true,
-            PatchOption::Optional(inner) => matches!(inner.as_ref(), PatchOption::WledPresetCount),
-            _ => false,
+        let opt = match opt {
+            PatchOption::Optional(inner) => inner.as_ref(),
+            other => other,
         };
-        if !counts_presets {
-            continue;
-        }
-        if let Some(entry) = entries.iter_mut().find(|(k, _)| k == key) {
-            entry.1 = preset_count.to_string();
+        let value = match opt {
+            // A count the node did not give is left as it was typed.
+            PatchOption::WledPresetCount => node.preset_count.map(|count| count.to_string()),
+            // An address left over from another node would send this one's
+            // fixture looking for that one, so it is cleared if unknown.
+            PatchOption::WledMac => Some(
+                node.mac
+                    .as_ref()
+                    .map(|mac| mac.to_string())
+                    .unwrap_or_default(),
+            ),
+            _ => None,
+        };
+        if let (Some(value), Some(entry)) = (value, entries.iter_mut().find(|(k, _)| k == key)) {
+            entry.1 = value;
         }
     }
 }
