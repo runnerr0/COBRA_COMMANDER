@@ -1,0 +1,15 @@
+[package]
+name = "wled_discovery"
+version = "0.1.0"
+edition = "2024"
+description = "Find WLED nodes on the local network and read how each is configured."
+
+[dependencies]
+log = "0.4"
+mdns-sd = "0.18"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
