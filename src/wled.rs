@@ -4,6 +4,7 @@
 //! HTTP otherwise.
 use log::{debug, error, info, warn};
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
     num::NonZeroU8,
     sync::{
@@ -89,6 +90,38 @@ pub struct WledController {
     flasher: Arc<Mutex<Option<Flasher>>>,
     /// Whether pixel ports may drive this node; see [`Self::allow_pixels`].
     pixels_allowed: Arc<AtomicBool>,
+    preset_names: PresetNames,
+}
+
+/// The names of a node's presets by preset ID, filled in by the sender once
+/// the node has been asked for them.
+#[derive(Debug, Clone, Default)]
+pub struct PresetNames(Arc<Mutex<BTreeMap<u8, String>>>);
+
+impl PresetNames {
+    /// The name of preset `id`, if the node has told us one.
+    pub fn get(&self, id: u8) -> Option<String> {
+        self.0.lock().ok()?.get(&id).cloned()
+    }
+
+    /// Ask the node for its presets' names. Return whether it answered.
+    fn fetch(&self, wled: &Wled) -> bool {
+        // The client keeps the URL of the last thing it asked for, so the
+        // path is given from the root.
+        let names = wled
+            .url
+            .join("/presets.json")
+            .ok()
+            .and_then(|presets| wled.client.get(presets).send().ok())
+            .filter(|response| response.status().is_success())
+            .and_then(|response| response.text().ok())
+            .and_then(|presets| discovery::preset_names(&presets));
+        let (Some(names), Ok(mut known)) = (names, self.0.lock()) else {
+            return false;
+        };
+        *known = names;
+        true
+    }
 }
 
 impl WledController {
@@ -106,7 +139,9 @@ impl WledController {
         let outbox = Arc::new(Outbox::default());
         let flasher = Arc::new(Mutex::new(None));
         let pixels_allowed = Arc::new(AtomicBool::new(true));
+        let preset_names = PresetNames::default();
 
+        let sender_preset_names = preset_names.clone();
         let sender_pixels_allowed = pixels_allowed.clone();
         let sender_flasher = flasher.clone();
         let sender_outbox = outbox.clone();
@@ -138,6 +173,10 @@ impl WledController {
             };
             let mut can_flash = connect_flasher(&mut wled, true);
             let mut flasher_tried = Instant::now();
+            // Asked for once there is nothing to send, so that a state
+            // already waiting does not wait on it.
+            let mut names_known = false;
+            let mut names_tried: Option<Instant> = None;
             let mut link = Link::new(wled);
             loop {
                 match sender_outbox.wait(&shutdown) {
@@ -157,6 +196,12 @@ impl WledController {
                             can_flash = connect_flasher(&mut link.wled, false);
                             flasher_tried = Instant::now();
                         }
+                        if !names_known
+                            && names_tried.is_none_or(|tried| tried.elapsed() >= retry_interval)
+                        {
+                            names_known = sender_preset_names.fetch(&link.wled);
+                            names_tried = Some(Instant::now());
+                        }
                     }
                     Wake::Stop => break,
                 }
@@ -169,7 +214,13 @@ impl WledController {
             outbox,
             flasher,
             pixels_allowed,
+            preset_names,
         }
+    }
+
+    /// The names of the node's presets, as far as the node has told us.
+    pub fn preset_names(&self) -> PresetNames {
+        self.preset_names.clone()
     }
 
     /// Let pixel ports drive this node, or make them stand down so the node
@@ -821,6 +872,23 @@ mod tests {
             fake.next_realtime_packet(Duration::from_secs(5)),
             Some(vec![4, 0])
         );
+    }
+
+    /// The controller learns the names the node gives its presets.
+    #[test]
+    fn controller_learns_the_names_of_the_nodes_presets() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        let names = controller.preset_names();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while names.get(1).is_none() {
+            assert!(Instant::now() < deadline, "no preset names arrived");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(names.get(1).as_deref(), Some("Warm"));
+        assert_eq!(names.get(2), None);
+        assert_eq!(names.get(3).as_deref(), Some("Chase"));
     }
 
     /// A strip with a white channel flashes on all four.

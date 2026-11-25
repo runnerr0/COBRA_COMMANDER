@@ -6,7 +6,7 @@ use crate::{
     color::{Hsv, RenderColor},
     fixture::prelude::*,
     strobe::FlashState,
-    wled::{WledControlMessage, WledController, WledPresetCount, WledUrl},
+    wled::{PresetNames, WledControlMessage, WledController, WledPresetCount, WledUrl},
 };
 use wled_json_api_library::structures::state::{Seg, State};
 
@@ -48,6 +48,31 @@ const PALETTES: [(&str, u8); 10] = [
     ("Fire", 35),
 ];
 
+/// The labels on the preset buttons of the control surface.
+const PRESET_LABELS: LabelArray = LabelArray {
+    control: "PresetLabel",
+    n: 6,
+    empty_label: "",
+};
+
+/// What to write on the preset buttons: each preset's name on the node, or
+/// its number until the node has told us one.
+#[derive(Debug)]
+struct PresetLabels {
+    names: PresetNames,
+    preset_count: u8,
+}
+
+impl PresetLabels {
+    fn labels(&self) -> impl Iterator<Item = String> + '_ {
+        (1..=self.preset_count).map(|id| self.names.get(id).unwrap_or_else(|| id.to_string()))
+    }
+
+    fn emit_state(&self, emitter: &FixtureStateEmitter) {
+        PRESET_LABELS.set(self.labels(), emitter);
+    }
+}
+
 #[derive(Debug, EmitState, Control, DescribeControls)]
 pub struct Wled {
     #[channel_control]
@@ -61,6 +86,8 @@ pub struct Wled {
     size: ChannelKnobUnipolar<Unipolar<()>>,
     #[on_change = "update_preset"]
     preset: IndexedSelect<()>,
+    #[skip_control]
+    preset_labels: PresetLabels,
     #[on_change = "update_look"]
     effect: LabeledSelect,
     #[on_change = "update_look"]
@@ -99,6 +126,7 @@ impl PatchFixture for Wled {
     type PatchOptions = NoOptions;
 
     fn new(options: Self::GroupOptions) -> Self {
+        let controller = WledController::run(options.url.0);
         Self {
             level: Unipolar::new("Level", ()).with_channel_level(),
             speed: Unipolar::new("Speed", ()).with_channel_knob(0),
@@ -109,12 +137,16 @@ impl PatchFixture for Wled {
                 false,
                 (),
             ),
+            preset_labels: PresetLabels {
+                names: controller.preset_names(),
+                preset_count: options.preset_count.0.get(),
+            },
             effect: LabeledSelect::new("Effect", 0, EFFECTS.to_vec()),
             palette: LabeledSelect::new("Palette", 0, PALETTES.to_vec()),
             hue: PhaseControl::new("Hue", ()).at_half(),
             sat: Unipolar::new("Sat", ()).at_full(),
             pixels: Bool::new_on("Pixels", ()),
-            controller: WledController::run(options.url.0),
+            controller,
             flash: FlashState::new(FLASH_RESPONSE),
         }
     }
@@ -231,7 +263,7 @@ impl Wled {
         self.controller.allow_pixels(self.pixels.val());
     }
 
-    fn update_preset(&self, _emitter: &FixtureStateEmitter) {
+    fn update_preset(&self, emitter: &FixtureStateEmitter) {
         // WLED numbers presets from 1.
         let preset_id = self.preset.selected().saturating_add(1);
         let mut state = State {
@@ -242,6 +274,9 @@ impl Wled {
         self.set_speed(&mut state);
         self.set_size(&mut state);
         self.controller.send(WledControlMessage::SetState(state));
+        // The node may have told us its presets' names since the labels
+        // were last written.
+        self.preset_labels.emit_state(emitter);
     }
 }
 
@@ -261,7 +296,31 @@ mod tests {
     use crate::config::{GroupId, GroupName, Options};
     use crate::fixture::patch::PATCHERS;
     use crate::osc::{OscClientId, OscControlMessage};
-    use crate::wled::fake::FakeWled;
+    use crate::wled::{WledController, fake::FakeWled};
+
+    use super::PresetLabels;
+    use std::time::Duration;
+
+    /// A preset button carries the preset's name once the node has told us
+    /// it, and its number until then or if it has none.
+    #[test]
+    fn preset_buttons_are_labelled_with_names_or_numbers() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        let labels = PresetLabels {
+            names: controller.preset_names(),
+            preset_count: 4,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while labels.names.get(1).is_none() {
+            assert!(std::time::Instant::now() < deadline, "no names arrived");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            labels.labels().collect::<Vec<_>>(),
+            vec!["Warm", "2", "Chase", "4"]
+        );
+    }
 
     /// Picking an effect on the control surface sends the node that effect
     /// along with the palette and colour the other controls are set to.

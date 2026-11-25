@@ -129,6 +129,25 @@ fn highest_preset_id(presets: &str) -> Option<u8> {
         .max()
 }
 
+/// The names of the presets in the contents of a node's `presets.json`, by
+/// preset ID, or None if the contents cannot be read.
+///
+/// A preset saved without a name is left out.
+pub fn preset_names(presets: &str) -> Option<BTreeMap<u8, String>> {
+    // JSON is a subset of YAML.
+    let presets: BTreeMap<String, serde_yaml::Value> = serde_yaml::from_str(presets).ok()?;
+    Some(
+        presets
+            .iter()
+            .filter_map(|(id, preset)| {
+                let id = id.parse::<u8>().ok().filter(|id| *id > 0)?;
+                let name = preset.get("n")?.as_str()?.trim();
+                (!name.is_empty()).then(|| (id, name.to_string()))
+            })
+            .collect(),
+    )
+}
+
 /// The instance part of an mDNS service's full name.
 fn instance_name(fullname: &str) -> &str {
     fullname
@@ -342,6 +361,17 @@ mod tests {
     fn highest_preset_id_skips_the_empty_entry_and_gaps() {
         let presets = r#"{"0":{},"1":{"n":"Warm","on":true},"3":{"n":"Chase","bri":128}}"#;
         assert_eq!(highest_preset_id(presets), Some(3));
+    }
+
+    #[test]
+    fn preset_names_are_read_by_id_and_unnamed_presets_left_out() {
+        let presets = r#"{"0":{},"1":{"n":"Warm","on":true},"2":{"bri":9},"3":{"n":" Chase "}}"#;
+        let names = preset_names(presets).unwrap();
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            vec![(1, "Warm".to_string()), (3, "Chase".to_string())]
+        );
+        assert_eq!(preset_names("not json"), None);
     }
 
     #[test]
