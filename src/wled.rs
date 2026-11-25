@@ -12,6 +12,9 @@ use wled_json_api_library::{structures::state::State, wled::Wled};
 use crate::worker::Shutdown;
 
 pub mod discovery;
+#[cfg(test)]
+pub mod fake;
+pub mod pixels;
 
 /// How long to wait between attempts to reach a WLED instance at startup.
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -193,69 +196,7 @@ pub enum WledControlMessage {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{BufRead, BufReader, Read, Write},
-        net::{TcpListener, TcpStream},
-        sync::mpsc::{Receiver, Sender, channel},
-    };
-
-    use super::*;
-
-    /// A stand-in for a WLED node: accepts every request with 200 and reports
-    /// the bodies posted to `/json/state`.
-    struct FakeWled {
-        url: Url,
-        posted: Receiver<State>,
-    }
-
-    impl FakeWled {
-        fn start() -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
-            let (send, posted) = channel();
-            // Serves until the test process exits.
-            std::thread::spawn(move || {
-                for stream in listener.incoming().flatten() {
-                    serve(stream, &send);
-                }
-            });
-            Self { url, posted }
-        }
-
-        /// The next state posted, failing the test if none arrives.
-        fn next_state(&self) -> State {
-            self.posted.recv_timeout(Duration::from_secs(5)).unwrap()
-        }
-    }
-
-    /// Answer one request, closing the connection afterwards.
-    fn serve(stream: TcpStream, posted: &Sender<State>) {
-        let mut reader = BufReader::new(&stream);
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line).unwrap();
-        let mut body_len = 0;
-        loop {
-            let mut header = String::new();
-            reader.read_line(&mut header).unwrap();
-            if header.trim().is_empty() {
-                break;
-            }
-            if let Some((name, value)) = header.split_once(':')
-                && name.eq_ignore_ascii_case("content-length")
-            {
-                body_len = value.trim().parse().unwrap();
-            }
-        }
-        let mut body = vec![0; body_len];
-        reader.read_exact(&mut body).unwrap();
-        if request_line.starts_with("POST /json/state") {
-            // JSON is a subset of YAML.
-            let _ = posted.send(serde_yaml::from_slice(&body).unwrap());
-        }
-        (&stream)
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-            .unwrap();
-    }
+    use super::{fake::FakeWled, *};
 
     #[test]
     fn controller_posts_state_without_a_transition() {

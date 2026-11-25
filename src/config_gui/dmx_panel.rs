@@ -6,6 +6,7 @@ use eframe::egui;
 use crate::control::MetaCommand;
 use crate::gui_state::DmxPortStatus;
 use crate::ui_util::GuiContext;
+use crate::wled::{discovery::WledDiscovery, pixels::WledPixelPort};
 use gui_common::STATUS_COLORS;
 
 /// Per-universe mutable UI state for the DMX port panel.
@@ -24,6 +25,9 @@ pub struct DmxPortPanelState {
     available_ports: Vec<Box<dyn rust_dmx::DmxPort>>,
     scan_artnet: bool,
     artnet_timeout_secs: String,
+    /// Whether a refresh lists the pixel ports of WLED nodes on the network.
+    scan_wled: bool,
+    wled_discovery: WledDiscovery,
     /// Selected port in the available list. None = "offline" selected.
     selected_port: Option<usize>,
     /// One entry per universe; resized to match the snapshot each frame.
@@ -31,11 +35,20 @@ pub struct DmxPortPanelState {
 }
 
 impl DmxPortPanelState {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_wled_discovery(WledDiscovery::default())
+    }
+
+    /// A panel that lists the pixel ports of the WLED nodes `wled_discovery`
+    /// finds.
+    pub fn with_wled_discovery(wled_discovery: WledDiscovery) -> Self {
         Self {
             available_ports: Vec::new(),
             scan_artnet: false,
             artnet_timeout_secs: "3".to_string(),
+            scan_wled: false,
+            wled_discovery,
             selected_port: None,
             universes: Vec::new(),
         }
@@ -88,6 +101,12 @@ impl DmxPortPanel<'_> {
                 if !artnet_valid {
                     ui.colored_label(STATUS_COLORS.error_text, "must be a positive number");
                 }
+            }
+            ui.checkbox(&mut self.state.scan_wled, "Scan WLED");
+            if self.state.scan_wled {
+                // Nodes take a moment to answer, so start looking as soon as
+                // the box is checked rather than at the next refresh.
+                self.state.wled_discovery.nodes();
             }
         });
 
@@ -282,7 +301,14 @@ impl DmxPortPanel<'_> {
         };
 
         match rust_dmx::available_ports(artnet_timeout) {
-            Ok(ports) => {
+            Ok(mut ports) => {
+                if self.state.scan_wled {
+                    for node in self.state.wled_discovery.nodes() {
+                        for port in WledPixelPort::for_node(&node) {
+                            ports.push(Box::new(port));
+                        }
+                    }
+                }
                 self.state.available_ports = ports;
                 self.state.selected_port = None;
             }
@@ -311,6 +337,60 @@ mod test {
 
     fn debug_open() -> AtomicBool {
         AtomicBool::new(false)
+    }
+
+    /// With "Scan WLED" checked, a refresh lists a port for each universe of
+    /// LEDs on each node found.
+    #[test]
+    fn refresh_lists_wled_pixel_ports() {
+        use crate::wled::discovery::{DEFAULT_UDP_PORT, WledNode, mock::FixedWledBrowser};
+
+        let client = auto_respond_client();
+        let status = DmxPortStatus { ports: vec![] };
+        let mut modal = MessageModal::default();
+        let mut state = DmxPortPanelState::with_wled_discovery(WledDiscovery::with_browser(
+            FixedWledBrowser(vec![WledNode {
+                name: "wled-kitchen".to_string(),
+                address: std::net::Ipv4Addr::new(10, 0, 0, 7),
+                port: 80,
+                udp_port: DEFAULT_UDP_PORT,
+                led_count: Some(300),
+            }]),
+        ));
+        let debug_open = debug_open();
+
+        let mut harness = Harness::new_ui(|ui| {
+            DmxPortPanel {
+                ctx: GuiContext {
+                    modal: &mut modal,
+                    client: &client,
+                },
+                state: &mut state,
+                port_status: &status,
+                debug_open: &debug_open,
+            }
+            .ui(ui);
+        });
+        harness.run();
+        harness.get_by_label("Scan WLED").click();
+        harness.run();
+        harness.get_by_label("Refresh").click();
+        harness.run();
+        drop(harness);
+
+        let wled_ports: Vec<String> = state
+            .available_ports
+            .iter()
+            .map(ToString::to_string)
+            .filter(|name| name.starts_with("WLED"))
+            .collect();
+        assert_eq!(
+            wled_ports,
+            [
+                "WLED wled-kitchen at 10.0.0.7 LEDs 1-170",
+                "WLED wled-kitchen at 10.0.0.7 LEDs 171-300",
+            ]
+        );
     }
 
     #[test]

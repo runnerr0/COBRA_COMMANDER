@@ -46,6 +46,7 @@ use crate::midi::ControlHandler;
 use crate::preview::Previewer;
 use crate::show::Show;
 use crate::ui_util::GuiContext;
+use crate::wled::discovery::WledDiscovery;
 use audio_panel::AudioPanelState;
 use clock_panel::{ClockPanel, ClockPanelState};
 use dmx_panel::{DmxPortPanel, DmxPortPanelState};
@@ -558,6 +559,8 @@ pub fn run_console(log_rx: Receiver<LogRecord>) -> Result<()> {
             let devices = tunnels::audio::AudioInput::devices().unwrap_or_default();
             let audio_panel = AudioPanelState::new(devices);
 
+            // One browser serves every panel that lists WLED nodes.
+            let wled_discovery = WledDiscovery::default();
             Ok(Box::new(ConsoleApp {
                 source_panel: ClockPanelState::new(&initial_clock_status),
                 audio_panel,
@@ -567,8 +570,8 @@ pub fn run_console(log_rx: Receiver<LogRecord>) -> Result<()> {
                 visualizer_panel: Arc::new(Mutex::new(VisualizerPanelState::default())),
                 visualizer_detached: Arc::new(AtomicBool::new(false)),
                 osc_panel: osc_panel::OscPanelState::new(bound_port),
-                patch_panel: PatchPanelState::new(),
-                dmx_panel: DmxPortPanelState::new(),
+                patch_panel: PatchPanelState::with_wled_discovery(wled_discovery.clone()),
+                dmx_panel: DmxPortPanelState::with_wled_discovery(wled_discovery),
                 dmx_debug_open: Arc::new(AtomicBool::new(false)),
                 dmx_debug_selected: Arc::new(AtomicUsize::new(0)),
                 positioner_panel: PositionerPanelState::default(),

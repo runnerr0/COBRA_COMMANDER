@@ -154,7 +154,13 @@ pub struct PatchPanelState {
 }
 
 impl PatchPanelState {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_wled_discovery(WledDiscovery::default())
+    }
+
+    /// A panel that offers the WLED nodes `wled_discovery` finds.
+    pub fn with_wled_discovery(wled_discovery: WledDiscovery) -> Self {
         Self {
             working_copy: None,
             selected_group: None,
@@ -162,7 +168,7 @@ impl PatchPanelState {
             mode: PanelMode::View,
             pending_delete: None,
             add_fixture_forms: HashMap::new(),
-            wled_discovery: WledDiscovery::Idle,
+            wled_discovery,
         }
     }
 }
@@ -1989,19 +1995,20 @@ mod test {
     /// Picking a discovered WLED node in the add-group form fills in its URL.
     #[test]
     fn picking_a_discovered_wled_node_fills_in_its_url() {
-        use crate::wled::discovery::{WledNode, mock::FixedWledBrowser};
+        use crate::wled::discovery::{DEFAULT_UDP_PORT, WledNode, mock::FixedWledBrowser};
 
         let client = auto_respond_client();
         let snapshot = test_snapshot_empty();
         let patchers = vec![mock_wled_patcher()];
         let mut modal = MessageModal::default();
         let mut state = PatchPanelState::new();
-        state.wled_discovery =
-            WledDiscovery::Browsing(Box::new(FixedWledBrowser(vec![WledNode {
-                name: "wled-kitchen".to_string(),
-                address: std::net::Ipv4Addr::new(10, 0, 0, 7),
-                port: 80,
-            }])));
+        state.wled_discovery = WledDiscovery::with_browser(FixedWledBrowser(vec![WledNode {
+            name: "wled-kitchen".to_string(),
+            address: std::net::Ipv4Addr::new(10, 0, 0, 7),
+            port: 80,
+            udp_port: DEFAULT_UDP_PORT,
+            led_count: Some(300),
+        }]));
         let mut form = AddGroupForm::new();
         form.sync_options(&patchers);
         state.mode = PanelMode::AddGroup(form);

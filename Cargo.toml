@@ -34,6 +34,7 @@ fixture_macros = { path = "fixture_macros" }
 rand = { version = "0.9", features = ["small_rng"] }
 wled-json-api-library = "0.1.7"
 mdns-sd = "0.18"
+typetag = "0.2"
 reqwest = "0.12"
 linkme = "0.3"
 hsluv = "0.3"
@@ -60,7 +61,6 @@ objc2-app-kit = "0.2"
 objc2-foundation = "0.2"
 
 [dev-dependencies]
-typetag = "0.2"
 tempfile = "3"
 egui_kittest = { version = "0.33", features = ["wgpu", "snapshot"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
