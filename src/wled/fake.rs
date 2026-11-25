@@ -56,6 +56,8 @@ struct Faults {
     booted: Mutex<Instant>,
     /// How long the node had been up at `booted`, in seconds.
     uptime_at_boot: AtomicUsize,
+    /// Whether the node reports LEDs with a white channel.
+    white: AtomicBool,
 }
 
 impl Faults {
@@ -68,6 +70,7 @@ impl Faults {
             booted: Mutex::new(Instant::now()),
             // A node that has been running for a while.
             uptime_at_boot: AtomicUsize::new(1000),
+            white: AtomicBool::new(false),
         }
     }
 
@@ -112,6 +115,12 @@ impl FakeWled {
             realtime,
             faults,
         }
+    }
+
+    /// Report LEDs with a white channel from now on.
+    pub fn with_white_channel(self) -> Self {
+        self.faults.white.store(true, Ordering::SeqCst);
+        self
     }
 
     /// Drop every open WebSocket without a closing handshake, as a node does
@@ -259,7 +268,8 @@ fn serve_http(
         ("500 Internal Server Error", String::new())
     } else if request_line.starts_with("GET /json/info") {
         let info = format!(
-            r#"{{"ver":"0.15.0","leds":{{"count":{LED_COUNT},"rgbw":true}},"udpport":{udp_port},"uptime":{}}}"#,
+            r#"{{"ver":"0.15.0","leds":{{"count":{LED_COUNT},"rgbw":{}}},"udpport":{udp_port},"uptime":{}}}"#,
+            faults.white.load(Ordering::SeqCst),
             faults.uptime()
         );
         ("200 OK", info)

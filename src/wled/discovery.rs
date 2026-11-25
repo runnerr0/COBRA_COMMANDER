@@ -354,7 +354,7 @@ mod tests {
     /// its details from its HTTP API.
     #[test]
     fn browser_finds_and_describes_an_advertised_node() {
-        let fake = FakeWled::start();
+        let fake = FakeWled::start().with_white_channel();
         let name = format!("cobra-test-{}", std::process::id());
         let advertiser = ServiceDaemon::new().unwrap();
         let service = ServiceInfo::new(

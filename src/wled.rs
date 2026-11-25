@@ -240,6 +240,8 @@ struct Flasher {
     /// The address the node takes realtime data on.
     node: SocketAddr,
     led_count: u16,
+    /// Whether the LEDs have a white channel.
+    white: bool,
     /// Whether the node is showing a flash of ours.
     flashing: bool,
 }
@@ -255,6 +257,11 @@ impl Flasher {
             .as_ref()
             .and_then(|leds| leds.count)
             .context("the node did not report its LED count")?;
+        let white = info
+            .leds
+            .as_ref()
+            .and_then(|leds| leds.rgbw)
+            .unwrap_or(false);
         let host = wled.url.host_str().context("the node's URL has no host")?;
         let udp_port = info.udpport.unwrap_or(DEFAULT_UDP_PORT);
         let realtime = Realtime::connect((host, udp_port), FLASH_TIMEOUT_SECS)
@@ -266,6 +273,7 @@ impl Flasher {
             realtime,
             node,
             led_count,
+            white,
             flashing: false,
         })
     }
@@ -276,9 +284,16 @@ impl Flasher {
         if pixels::pixels_streaming(self.node) {
             return Ok(());
         }
-        let white = std::iter::repeat_n([level; 3], usize::from(self.led_count));
+        let leds = usize::from(self.led_count);
         self.flashing = true;
-        self.realtime.show(0, white)
+        if self.white {
+            // Sent only colour, a strip with a white channel would flash
+            // without its brightest LEDs.
+            self.realtime
+                .show_rgbw(0, std::iter::repeat_n([level; 4], leds))
+        } else {
+            self.realtime.show(0, std::iter::repeat_n([level; 3], leds))
+        }
     }
 
     /// Hand the LEDs back if we lit them. A node we did not flash is left
@@ -800,6 +815,26 @@ mod tests {
             fake.next_realtime_packet(Duration::from_secs(5)),
             Some(vec![4, 0])
         );
+    }
+
+    /// A strip with a white channel flashes on all four.
+    #[test]
+    fn controller_flashes_the_white_channel_of_an_rgbw_node() {
+        let fake = FakeWled::start().with_white_channel();
+        let controller = WledController::run(fake.url.clone());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let packet = loop {
+            controller.flash(200);
+            if let Some(packet) = fake.next_realtime_packet(Duration::from_millis(50)) {
+                break packet;
+            }
+            assert!(std::time::Instant::now() < deadline, "no flash arrived");
+        };
+        assert_eq!(packet[..4], [5, FLASH_TIMEOUT_SECS, 0, 0]);
+        let leds = &packet[4..];
+        assert_eq!(leds.len(), usize::from(fake::LED_COUNT) * 4);
+        assert!(leds.iter().all(|&channel| channel == 200));
     }
 
     /// Disallowing pixels makes the node's pixel port let go, even when the
