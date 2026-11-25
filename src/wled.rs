@@ -41,6 +41,13 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long to wait before trying again to open a node's WebSocket.
 const SOCKET_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The least time between states sent to a node.
+///
+/// A control surface reports a moving fader far faster than a
+/// microcontroller can parse JSON and repaint. This is short enough not to
+/// be felt.
+const MIN_SEND_INTERVAL: Duration = Duration::from_millis(20);
+
 /// How long to wait before telling a node again what it failed to take.
 const RESEND_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -126,6 +133,12 @@ impl WledController {
                     Wake::State(state) => {
                         debug!("Sending WLED state to {sender_url}.");
                         link.send(state);
+                        // Changes made in the meantime collapse into one, so
+                        // a fader in motion costs the node a bounded number
+                        // of messages and the last one still arrives.
+                        if shutdown.sleep_or_shutdown(MIN_SEND_INTERVAL) {
+                            break;
+                        }
                     }
                     Wake::Idle => {
                         link.keep_up();
@@ -911,6 +924,34 @@ mod tests {
         let state = fake.next_state();
         assert_eq!(state.bri, Some(20));
         assert_eq!(state.seg.unwrap().remove(0).fx, Some(108));
+    }
+
+    /// A fader in motion posts states far faster than a node should be
+    /// sent them. Only some go out, and the last one always does.
+    #[test]
+    fn rapid_changes_are_paced_and_the_last_one_arrives() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        controller.send(WledControlMessage::SetState(level(1)));
+        assert_eq!(fake.next_state().bri, Some(1));
+
+        let started = Instant::now();
+        for bri in 2..=201 {
+            controller.send(WledControlMessage::SetState(level(bri)));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut received = 0;
+        loop {
+            received += 1;
+            if fake.next_state().bri == Some(201) {
+                break;
+            }
+        }
+        let most = started.elapsed().as_millis() / MIN_SEND_INTERVAL.as_millis() + 2;
+        assert!(
+            received <= most,
+            "{received} states sent where at most {most} should have been"
+        );
     }
 
     /// A quiet socket is checked with WLED's heartbeat, which is what finds
