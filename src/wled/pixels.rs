@@ -1,11 +1,11 @@
-//! Drive a WLED node's LEDs directly, as a DMX port.
+//! Drive a WLED node's LEDs directly.
 //!
-//! Each frame goes out as one packet of WLED's UDP realtime protocol. WLED
-//! shows realtime data in place of its own effect for as long as it keeps
-//! arriving, so nothing on the node needs to be reconfigured.
+//! Pixels go out in WLED's UDP realtime protocol. WLED shows realtime data in
+//! place of its own effect for as long as it keeps arriving, so nothing on the
+//! node needs to be reconfigured.
 use std::{
-    fmt,
-    net::{Ipv4Addr, UdpSocket},
+    fmt, io,
+    net::{Ipv4Addr, ToSocketAddrs, UdpSocket},
 };
 
 use anyhow::Context;
@@ -17,23 +17,82 @@ use super::discovery::WledNode;
 /// How many RGB pixels fit in one DMX universe.
 pub const PIXELS_PER_UNIVERSE: u16 = 170;
 
-/// DMX channels per pixel.
-const CHANNELS_PER_PIXEL: usize = 3;
-
 /// The first byte of a DNRGB packet: RGB pixels from a given start index.
 const PROTOCOL_DNRGB: u8 = 4;
 
-/// Seconds WLED keeps showing realtime data after the last packet. This
-/// bounds how long a node holds its last frame if we stop without saying so.
-const TIMEOUT_SECS: u8 = 2;
+/// The most LEDs WLED accepts in one DNRGB packet.
+const MAX_LEDS_PER_PACKET: usize = 489;
 
 /// A timeout of zero makes WLED leave realtime mode at once.
 const RELEASE: [u8; 2] = [PROTOCOL_DNRGB, 0];
 
-/// A run of up to [`PIXELS_PER_UNIVERSE`] LEDs on a WLED node.
+/// An RGB colour for one LED.
+pub type Pixel = [u8; 3];
+
+/// A connection for showing pixels on a WLED node.
+#[derive(Debug)]
+pub struct Realtime {
+    socket: UdpSocket,
+    /// Seconds WLED keeps showing our pixels after the last packet. This
+    /// bounds how long a node holds them if we stop without releasing it.
+    timeout_secs: u8,
+    packet: Vec<u8>,
+}
+
+impl Realtime {
+    /// Address the realtime port of a WLED node.
+    pub fn connect(node: impl ToSocketAddrs, timeout_secs: u8) -> io::Result<Self> {
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        socket.connect(node)?;
+        Ok(Self {
+            socket,
+            timeout_secs,
+            packet: Vec::new(),
+        })
+    }
+
+    /// Show `pixels` on consecutive LEDs, starting from `first_led`.
+    pub fn show(
+        &mut self,
+        first_led: u16,
+        pixels: impl IntoIterator<Item = Pixel>,
+    ) -> io::Result<()> {
+        let mut pixels = pixels.into_iter().peekable();
+        let mut first_led = first_led;
+        while pixels.peek().is_some() {
+            let [first_hi, first_lo] = first_led.to_be_bytes();
+            self.packet.clear();
+            self.packet
+                .extend([PROTOCOL_DNRGB, self.timeout_secs, first_hi, first_lo]);
+            let mut led_count: u16 = 0;
+            for pixel in pixels.by_ref().take(MAX_LEDS_PER_PACKET) {
+                self.packet.extend(pixel);
+                led_count += 1;
+            }
+            self.socket.send(&self.packet)?;
+            first_led = first_led.saturating_add(led_count);
+        }
+        Ok(())
+    }
+
+    /// Hand the LEDs back to WLED now rather than after the timeout.
+    pub fn release(&self) -> io::Result<()> {
+        self.socket.send(&RELEASE).map(|_| ())
+    }
+}
+
+/// Seconds a node holds a port's last frame if the port stops without
+/// releasing it.
+const PORT_TIMEOUT_SECS: u8 = 2;
+
+fn one_led_per_pixel() -> u16 {
+    1
+}
+
+/// A run of a WLED node's LEDs, as a DMX port.
 ///
-/// Each LED takes three consecutive DMX channels, red, green then blue,
-/// starting from channel 1.
+/// Each pixel takes three consecutive DMX channels, red, green then blue,
+/// starting from channel 1, and lights `leds_per_pixel` consecutive LEDs.
 #[derive(Serialize, Deserialize)]
 pub struct WledPixelPort {
     /// The name of the node, for display.
@@ -43,28 +102,31 @@ pub struct WledPixelPort {
     /// Index of the first LED this port drives.
     first_led: u16,
     led_count: u16,
+    #[serde(default = "one_led_per_pixel")]
+    leds_per_pixel: u16,
     #[serde(skip)]
-    socket: Option<UdpSocket>,
-    #[serde(skip)]
-    packet: Vec<u8>,
+    realtime: Option<Realtime>,
 }
 
 impl WledPixelPort {
-    /// The ports that together cover every LED of `node`.
+    /// The ports that together cover every LED of `node`, each pixel lighting
+    /// `leds_per_pixel` LEDs.
     ///
     /// A node that has not reported its LED count gets one full universe.
-    pub fn for_node(node: &WledNode) -> Vec<Self> {
-        let total = node.led_count.unwrap_or(PIXELS_PER_UNIVERSE);
+    pub fn for_node(node: &WledNode, leds_per_pixel: u16) -> Vec<Self> {
+        let leds_per_pixel = leds_per_pixel.max(1);
+        let leds_per_universe = PIXELS_PER_UNIVERSE.saturating_mul(leds_per_pixel);
+        let total = node.led_count.unwrap_or(leds_per_universe);
         (0..total)
-            .step_by(usize::from(PIXELS_PER_UNIVERSE))
+            .step_by(usize::from(leds_per_universe))
             .map(|first_led| Self {
                 name: node.name.clone(),
                 address: node.address,
                 udp_port: node.udp_port,
                 first_led,
-                led_count: (total - first_led).min(PIXELS_PER_UNIVERSE),
-                socket: None,
-                packet: Vec::new(),
+                led_count: (total - first_led).min(leds_per_universe),
+                leds_per_pixel,
+                realtime: None,
             })
             .collect()
     }
@@ -79,50 +141,45 @@ impl fmt::Display for WledPixelPort {
             self.address,
             self.first_led + 1,
             self.first_led + self.led_count,
-        )
+        )?;
+        if self.leds_per_pixel > 1 {
+            write!(f, ", {} per pixel", self.leds_per_pixel)?;
+        }
+        Ok(())
     }
 }
 
 #[typetag::serde]
 impl DmxPort for WledPixelPort {
     fn open(&mut self) -> Result<(), OpenError> {
-        if self.socket.is_some() {
+        if self.realtime.is_some() {
             return Ok(());
         }
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-            .context("failed to bind a UDP socket for WLED")?;
-        socket
-            .connect((self.address, self.udp_port))
-            .context("failed to address the WLED node")?;
-        self.socket = Some(socket);
+        let realtime = Realtime::connect((self.address, self.udp_port), PORT_TIMEOUT_SECS)
+            .context("failed to open a UDP socket to the WLED node")?;
+        self.realtime = Some(realtime);
         Ok(())
     }
 
     fn close(&mut self) {
-        if let Some(socket) = self.socket.take() {
-            // Hand the LEDs back to WLED now rather than after the timeout.
-            let _ = socket.send(&RELEASE);
+        if let Some(realtime) = self.realtime.take() {
+            let _ = realtime.release();
         }
     }
 
     fn write(&mut self, frame: &[u8]) -> Result<(), WriteError> {
-        let Some(socket) = &self.socket else {
+        let Some(realtime) = &mut self.realtime else {
             return Err(WriteError::Disconnected);
         };
-        let [first_hi, first_lo] = self.first_led.to_be_bytes();
-        let channels = usize::from(self.led_count) * CHANNELS_PER_PIXEL;
-        self.packet.clear();
-        self.packet
-            .extend([PROTOCOL_DNRGB, TIMEOUT_SECS, first_hi, first_lo]);
-        self.packet.extend(
-            frame
-                .iter()
-                .copied()
-                .chain(std::iter::repeat(0))
-                .take(channels),
-        );
-        socket
-            .send(&self.packet)
+        // A frame shorter than the universe leaves the remaining LEDs black.
+        let pixels = frame
+            .chunks_exact(3)
+            .map(|rgb| [rgb[0], rgb[1], rgb[2]])
+            .chain(std::iter::repeat([0; 3]))
+            .flat_map(|pixel| std::iter::repeat_n(pixel, usize::from(self.leds_per_pixel)))
+            .take(usize::from(self.led_count));
+        realtime
+            .show(self.first_led, pixels)
             .context("failed to send pixels to WLED")?;
         Ok(())
     }
@@ -158,7 +215,7 @@ mod tests {
     }
 
     fn receive(socket: &UdpSocket) -> Vec<u8> {
-        let mut buf = [0; 1024];
+        let mut buf = [0; 2048];
         let len = socket.recv(&mut buf).unwrap();
         buf[..len].to_vec()
     }
@@ -175,7 +232,7 @@ mod tests {
 
     #[test]
     fn ports_cover_every_led_of_a_node() {
-        let names: Vec<String> = WledPixelPort::for_node(&node(Some(300)))
+        let names: Vec<String> = WledPixelPort::for_node(&node(Some(300)), 1)
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -190,15 +247,57 @@ mod tests {
 
     #[test]
     fn node_of_unknown_size_gets_one_universe() {
-        let ports = WledPixelPort::for_node(&node(None));
+        let ports = WledPixelPort::for_node(&node(None), 1);
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].led_count, PIXELS_PER_UNIVERSE);
     }
 
     #[test]
+    fn wider_pixels_cover_more_leds_per_port() {
+        let names: Vec<String> = WledPixelPort::for_node(&node(Some(300)), 2)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            names,
+            ["WLED wled-kitchen at 10.0.0.7 LEDs 1-300, 2 per pixel"]
+        );
+    }
+
+    #[test]
+    fn wider_pixel_lights_each_of_its_leds() {
+        let (socket, node) = listening_node(Some(5));
+        let mut ports = WledPixelPort::for_node(&node, 2);
+        let port = &mut ports[0];
+        port.open().unwrap();
+        port.write(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
+
+        // Two LEDs for each of the first two pixels, one for the third.
+        assert_eq!(
+            receive(&socket),
+            [4, 2, 0, 0, 1, 2, 3, 1, 2, 3, 4, 5, 6, 4, 5, 6, 7, 8, 9]
+        );
+    }
+
+    #[test]
+    fn long_run_is_split_across_packets() {
+        let (socket, _) = listening_node(None);
+        let mut realtime = Realtime::connect(socket.local_addr().unwrap(), 1).unwrap();
+        realtime.show(0, std::iter::repeat_n([7; 3], 500)).unwrap();
+
+        let first = receive(&socket);
+        assert_eq!(first[..4], [4, 1, 0, 0]);
+        assert_eq!(first.len(), 4 + 489 * 3);
+        // The second packet picks up at LED 489.
+        let second = receive(&socket);
+        assert_eq!(second[..4], [4, 1, 1, 233]);
+        assert_eq!(second.len(), 4 + 11 * 3);
+    }
+
+    #[test]
     fn write_sends_the_frame_as_dnrgb() {
         let (socket, node) = listening_node(Some(2));
-        let mut ports = WledPixelPort::for_node(&node);
+        let mut ports = WledPixelPort::for_node(&node, 1);
         let port = &mut ports[0];
         port.open().unwrap();
         port.write(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
@@ -210,7 +309,7 @@ mod tests {
     #[test]
     fn second_port_starts_at_its_first_led() {
         let (socket, node) = listening_node(Some(171));
-        let mut ports = WledPixelPort::for_node(&node);
+        let mut ports = WledPixelPort::for_node(&node, 1);
         let port = &mut ports[1];
         port.open().unwrap();
         port.write(&[9, 8, 7]).unwrap();
@@ -221,7 +320,7 @@ mod tests {
     #[test]
     fn short_frame_is_padded_with_black() {
         let (socket, node) = listening_node(Some(2));
-        let mut ports = WledPixelPort::for_node(&node);
+        let mut ports = WledPixelPort::for_node(&node, 1);
         let port = &mut ports[0];
         port.open().unwrap();
         port.write(&[1, 2, 3]).unwrap();
@@ -232,7 +331,7 @@ mod tests {
     #[test]
     fn closing_releases_the_node() {
         let (socket, node) = listening_node(Some(2));
-        let mut ports = WledPixelPort::for_node(&node);
+        let mut ports = WledPixelPort::for_node(&node, 1);
         let port = &mut ports[0];
         port.open().unwrap();
         port.close();
@@ -242,7 +341,7 @@ mod tests {
 
     #[test]
     fn write_fails_until_opened() {
-        let mut ports = WledPixelPort::for_node(&node(Some(2)));
+        let mut ports = WledPixelPort::for_node(&node(Some(2)), 1);
         assert!(matches!(
             ports[0].write(&[1, 2, 3]),
             Err(WriteError::Disconnected)
@@ -253,7 +352,7 @@ mod tests {
     #[test]
     fn port_survives_a_round_trip_through_a_show_file() {
         let (socket, node) = listening_node(Some(2));
-        let port: Box<dyn DmxPort> = Box::new(WledPixelPort::for_node(&node).remove(0));
+        let port: Box<dyn DmxPort> = Box::new(WledPixelPort::for_node(&node, 1).remove(0));
         let saved = serde_yaml::to_string(&port).unwrap();
         let mut loaded: Box<dyn DmxPort> = serde_yaml::from_str(&saved).unwrap();
 

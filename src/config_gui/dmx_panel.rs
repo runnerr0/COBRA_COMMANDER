@@ -1,3 +1,4 @@
+use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -27,6 +28,8 @@ pub struct DmxPortPanelState {
     artnet_timeout_secs: String,
     /// Whether a refresh lists the pixel ports of WLED nodes on the network.
     scan_wled: bool,
+    /// Editable buffer for how many LEDs each pixel of a WLED port lights.
+    wled_leds_per_pixel: String,
     wled_discovery: WledDiscovery,
     /// Selected port in the available list. None = "offline" selected.
     selected_port: Option<usize>,
@@ -48,6 +51,7 @@ impl DmxPortPanelState {
             scan_artnet: false,
             artnet_timeout_secs: "3".to_string(),
             scan_wled: false,
+            wled_leds_per_pixel: "1".to_string(),
             wled_discovery,
             selected_port: None,
             universes: Vec::new(),
@@ -73,6 +77,8 @@ impl DmxPortPanel<'_> {
                 .map(|v| v > 0.0)
                 .unwrap_or(false);
 
+        let wled_valid = !self.state.scan_wled || self.wled_leds_per_pixel().is_some();
+
         // Header.
         ui.horizontal(|ui| {
             ui.heading("DMX Ports");
@@ -86,7 +92,7 @@ impl DmxPortPanel<'_> {
         // Refresh + ArtNet options.
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(artnet_valid, egui::Button::new("Refresh"))
+                .add_enabled(artnet_valid && wled_valid, egui::Button::new("Refresh"))
                 .clicked()
             {
                 self.refresh_ports();
@@ -107,6 +113,13 @@ impl DmxPortPanel<'_> {
                 // Nodes take a moment to answer, so start looking as soon as
                 // the box is checked rather than at the next refresh.
                 self.state.wled_discovery.nodes();
+                ui.label("LEDs per pixel:");
+                let edit = egui::TextEdit::singleline(&mut self.state.wled_leds_per_pixel)
+                    .desired_width(30.0);
+                ui.add(edit);
+                if !wled_valid {
+                    ui.colored_label(STATUS_COLORS.error_text, "must be a number from 1 up");
+                }
             }
         });
 
@@ -287,6 +300,11 @@ impl DmxPortPanel<'_> {
         }
     }
 
+    /// How many LEDs each pixel of a WLED port lights, if the entry is valid.
+    fn wled_leds_per_pixel(&self) -> Option<NonZeroU16> {
+        self.state.wled_leds_per_pixel.trim().parse().ok()
+    }
+
     fn refresh_ports(&mut self) {
         let artnet_timeout = if self.state.scan_artnet {
             let secs = self
@@ -302,9 +320,11 @@ impl DmxPortPanel<'_> {
 
         match rust_dmx::available_ports(artnet_timeout) {
             Ok(mut ports) => {
-                if self.state.scan_wled {
+                if self.state.scan_wled
+                    && let Some(leds_per_pixel) = self.wled_leds_per_pixel()
+                {
                     for node in self.state.wled_discovery.nodes() {
-                        for port in WledPixelPort::for_node(&node) {
+                        for port in WledPixelPort::for_node(&node, leds_per_pixel.get()) {
                             ports.push(Box::new(port));
                         }
                     }
