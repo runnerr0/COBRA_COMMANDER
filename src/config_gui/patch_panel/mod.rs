@@ -20,8 +20,8 @@ use gui_common::{
 
 use address_map::{AddressMap, UniverseAddress};
 use widgets::{
-    build_options_from_form, default_for_option, offers_wled_nodes, render_address_map,
-    render_option_widget, validate_option,
+    build_options_from_form, default_for_option, fill_from_wled_node, offers_wled_nodes,
+    render_address_map, render_option_widget, validate_option,
 };
 use working_copy::PatchWorkingCopy;
 
@@ -927,15 +927,21 @@ impl PatchPanel<'_> {
                     Vec::new()
                 };
                 ui.add_space(4.0);
+                let mut picked = None;
                 for (menu_key, menu_opt) in &menu {
                     if let Some(entry) = form.group_options.iter_mut().find(|(k, _)| k == menu_key)
                     {
-                        render_option_widget(ui, menu_key, menu_opt, &mut entry.1, &wled_nodes);
+                        let node =
+                            render_option_widget(ui, menu_key, menu_opt, &mut entry.1, &wled_nodes);
+                        picked = node.or(picked);
                         if let Err(msg) = validate_option(menu_opt, &entry.1) {
                             ui.colored_label(STATUS_COLORS.error_text, &msg);
                             all_valid = false;
                         }
                     }
+                }
+                if let Some(node) = picked {
+                    fill_from_wled_node(&menu, &mut form.group_options, &node);
                 }
             }
         }
@@ -1061,14 +1067,20 @@ impl PatchPanel<'_> {
                 } else {
                     Vec::new()
                 };
+                let mut picked = None;
                 for (opt_key, opt_type) in &patch_menu {
                     if let Some(entry) = form.patch_options.iter_mut().find(|(k, _)| k == opt_key) {
-                        render_option_widget(ui, opt_key, opt_type, &mut entry.1, &wled_nodes);
+                        let node =
+                            render_option_widget(ui, opt_key, opt_type, &mut entry.1, &wled_nodes);
+                        picked = node.or(picked);
                         if let Err(msg) = validate_option(opt_type, &entry.1) {
                             ui.colored_label(STATUS_COLORS.error_text, &msg);
                             all_valid = false;
                         }
                     }
+                }
+                if let Some(node) = picked {
+                    fill_from_wled_node(&patch_menu, &mut form.patch_options, &node);
                 }
             }
         }
@@ -1981,7 +1993,12 @@ mod test {
             name: FixtureType("WledNode"),
             patch_notes: "",
             create_group: |_, _, _| unimplemented!(),
-            group_options: || vec![("url".into(), PatchOption::WledUrl)],
+            group_options: || {
+                vec![
+                    ("url".into(), PatchOption::WledUrl),
+                    ("preset_count".into(), PatchOption::WledPresetCount),
+                ]
+            },
             create_patch: |_, _| {
                 Ok(PatchConfig {
                     channel_count: 0,
@@ -1992,9 +2009,10 @@ mod test {
         }
     }
 
-    /// Picking a discovered WLED node in the add-group form fills in its URL.
+    /// Picking a discovered WLED node in the add-group form fills in its URL
+    /// and how many presets it has.
     #[test]
-    fn picking_a_discovered_wled_node_fills_in_its_url() {
+    fn picking_a_discovered_wled_node_fills_in_its_url_and_preset_count() {
         use crate::wled::discovery::{DEFAULT_UDP_PORT, WledNode, mock::FixedWledBrowser};
 
         let client = auto_respond_client();
@@ -2041,7 +2059,10 @@ mod test {
         };
         assert_eq!(
             form.group_options,
-            vec![("url".to_string(), "http://10.0.0.7/".to_string())]
+            vec![
+                ("url".to_string(), "http://10.0.0.7/".to_string()),
+                ("preset_count".to_string(), "7".to_string()),
+            ]
         );
     }
 

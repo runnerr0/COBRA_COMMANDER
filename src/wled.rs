@@ -5,6 +5,7 @@
 use log::{debug, error, info, warn};
 use std::{
     net::SocketAddr,
+    num::NonZeroU8,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -73,6 +74,11 @@ const FLASH_TIMEOUT_SECS: u8 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
 pub struct WledUrl(pub Url);
+
+/// How many presets a WLED node has: the highest-numbered one saved on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct WledPresetCount(pub NonZeroU8);
 
 #[derive(Debug)]
 pub struct WledController {

@@ -7,7 +7,11 @@ use serde::{Deserialize, Deserializer, de};
 use strum::IntoEnumIterator;
 use url::Url;
 
-use crate::{config::Options, fixture::fixture::EnumRenderModel, wled::WledUrl};
+use crate::{
+    config::Options,
+    fixture::fixture::EnumRenderModel,
+    wled::{WledPresetCount, WledUrl},
+};
 /// A type that fixtures can use to declare that they do not accept patch options.
 #[derive(Deserialize)]
 #[serde(try_from = "ParseNoOptions")]
@@ -72,6 +76,12 @@ impl AsPatchOption for Url {
 impl AsPatchOption for WledUrl {
     fn as_patch_option() -> PatchOption {
         PatchOption::WledUrl
+    }
+}
+
+impl AsPatchOption for WledPresetCount {
+    fn as_patch_option() -> PatchOption {
+        PatchOption::WledPresetCount
     }
 }
 
@@ -174,6 +184,9 @@ pub enum PatchOption {
     /// The URL of a WLED node, which can be picked from those discovered on
     /// the network.
     WledUrl,
+    /// How many presets a WLED node has, from 1 to 255. Filled in when a
+    /// node is picked for a [`PatchOption::WledUrl`] in the same form.
+    WledPresetCount,
     /// A boolean option.
     Bool,
     /// A bipolar float in the range [-1, 1].
@@ -189,7 +202,9 @@ impl PatchOption {
     pub fn example_value(&self) -> serde_yaml::Value {
         use serde_yaml::Value;
         match self {
-            PatchOption::Int | PatchOption::NonZeroU8 => Value::Number(1.into()),
+            PatchOption::Int | PatchOption::NonZeroU8 | PatchOption::WledPresetCount => {
+                Value::Number(1.into())
+            }
             PatchOption::Bool => Value::Bool(false),
             PatchOption::Bipolar => Value::Number(0.0.into()),
             PatchOption::Unipolar => Value::Number(1.0.into()),
@@ -212,6 +227,7 @@ impl Display for PatchOption {
             Self::SocketAddr => f.write_str("<socket address>"),
             Self::Url => f.write_str("<url>"),
             Self::WledUrl => f.write_str("<WLED node url>"),
+            Self::WledPresetCount => f.write_str("<preset count, 1..255>"),
             Self::Bool => f.write_str("true, false"),
             Self::Bipolar => f.write_str("<bipolar float, -1..1>"),
             Self::Unipolar => f.write_str("<unipolar float, 0..1>"),

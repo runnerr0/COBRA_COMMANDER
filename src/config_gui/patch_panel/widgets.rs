@@ -14,7 +14,7 @@ pub fn default_for_option(opt: &PatchOption) -> String {
     match opt {
         PatchOption::Bool => "false".to_string(),
         PatchOption::Int => "0".to_string(),
-        PatchOption::NonZeroU8 => "1".to_string(),
+        PatchOption::NonZeroU8 | PatchOption::WledPresetCount => "1".to_string(),
         PatchOption::Bipolar => "0".to_string(),
         PatchOption::Unipolar => "1".to_string(),
         PatchOption::Select(choices) => choices.first().cloned().unwrap_or_default(),
@@ -31,7 +31,7 @@ pub fn validate_option(opt: &PatchOption, value: &str) -> Result<(), String> {
             .parse::<i64>()
             .map(|_| ())
             .map_err(|_| "must be a number".to_string()),
-        PatchOption::NonZeroU8 => value
+        PatchOption::NonZeroU8 | PatchOption::WledPresetCount => value
             .parse::<NonZeroU8>()
             .map(|_| ())
             .map_err(|_| "must be a number from 1 to 255".to_string()),
@@ -84,14 +84,16 @@ pub fn offers_wled_nodes(menu: &[(String, PatchOption)]) -> bool {
 /// Render the editor for one option.
 ///
 /// `wled_nodes` are the nodes a [`PatchOption::WledUrl`] offers to pick from.
+/// Return the node picked in this frame, if one was.
 pub fn render_option_widget(
     ui: &mut egui::Ui,
     key: &str,
     opt: &PatchOption,
     value: &mut String,
     wled_nodes: &[WledNode],
-) {
+) -> Option<WledNode> {
     let key_with_colon = format!("{key}:");
+    let mut picked = None;
     match opt {
         PatchOption::Bool => {
             let mut checked = value == "true";
@@ -113,6 +115,7 @@ pub fn render_option_widget(
         }
         PatchOption::Int
         | PatchOption::NonZeroU8
+        | PatchOption::WledPresetCount
         | PatchOption::Bipolar
         | PatchOption::Unipolar
         | PatchOption::Url
@@ -136,6 +139,7 @@ pub fn render_option_widget(
                         };
                         if ui.button(node.summary()).clicked() {
                             *value = url.to_string();
+                            picked = Some(node.clone());
                             ui.close();
                         }
                     }
@@ -160,8 +164,34 @@ pub fn render_option_widget(
                         });
                 });
             }
-            other => render_option_widget(ui, key, other, value, wled_nodes),
+            other => picked = render_option_widget(ui, key, other, value, wled_nodes),
         },
+    }
+    picked
+}
+
+/// Fill in the options of a form that a picked WLED node can answer for
+/// itself, so that its preset count does not have to be copied by hand.
+pub fn fill_from_wled_node(
+    menu: &[(String, PatchOption)],
+    entries: &mut [(String, String)],
+    node: &WledNode,
+) {
+    let Some(preset_count) = node.preset_count else {
+        return;
+    };
+    for (key, opt) in menu {
+        let counts_presets = match opt {
+            PatchOption::WledPresetCount => true,
+            PatchOption::Optional(inner) => matches!(inner.as_ref(), PatchOption::WledPresetCount),
+            _ => false,
+        };
+        if !counts_presets {
+            continue;
+        }
+        if let Some(entry) = entries.iter_mut().find(|(k, _)| k == key) {
+            entry.1 = preset_count.to_string();
+        }
     }
 }
 

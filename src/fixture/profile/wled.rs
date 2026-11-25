@@ -1,12 +1,12 @@
 //! Control profile for WLED via http/json API.
 
-use std::{num::NonZeroU8, time::Duration};
+use std::time::Duration;
 
 use crate::{
     color::{Hsv, RenderColor},
     fixture::prelude::*,
     strobe::FlashState,
-    wled::{WledControlMessage, WledController, WledUrl},
+    wled::{WledControlMessage, WledController, WledPresetCount, WledUrl},
 };
 use wled_json_api_library::structures::state::{Seg, State};
 
@@ -90,7 +90,7 @@ pub struct Wled {
 #[serde(deny_unknown_fields)]
 pub struct GroupOptions {
     pub url: WledUrl,
-    pub preset_count: NonZeroU8,
+    pub preset_count: WledPresetCount,
 }
 
 impl PatchFixture for Wled {
@@ -105,7 +105,7 @@ impl PatchFixture for Wled {
             size: Unipolar::new("Size", ()).with_channel_knob(1),
             preset: IndexedSelect::new(
                 "Preset",
-                usize::from(options.preset_count.get()),
+                usize::from(options.preset_count.0.get()),
                 false,
                 (),
             ),
@@ -333,10 +333,10 @@ pub mod rug_doctor {
         type PatchOptions = NoOptions;
 
         fn new(options: Self::GroupOptions) -> Self {
-            if options.presets.len() != usize::from(options.wled.preset_count.get()) {
+            if options.presets.len() != usize::from(options.wled.preset_count.0.get()) {
                 error!(
                     "WLED has {} presets but only {} are defined for astera",
-                    options.wled.preset_count,
+                    options.wled.preset_count.0,
                     options.presets.len(),
                 );
             }
