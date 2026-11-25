@@ -48,6 +48,8 @@ struct Faults {
     sockets: Mutex<Vec<TcpStream>>,
     /// How many more requests for the node's info to fail.
     info_failures: AtomicUsize,
+    /// How many heartbeats have arrived over WebSockets.
+    heartbeats: AtomicUsize,
 }
 
 impl FakeWled {
@@ -95,6 +97,11 @@ impl FakeWled {
         }
     }
 
+    /// How many heartbeats have arrived over WebSockets.
+    pub fn heartbeats(&self) -> usize {
+        self.faults.heartbeats.load(Ordering::SeqCst)
+    }
+
     /// Fail the next `count` requests for the node's info.
     pub fn fail_info_requests(&self, count: usize) {
         self.faults.info_failures.store(count, Ordering::SeqCst);
@@ -135,19 +142,27 @@ fn serve(
         if let Ok(handle) = stream.try_clone() {
             faults.sockets.lock().unwrap().push(handle);
         }
-        serve_websocket(stream, posted);
+        serve_websocket(stream, posted, faults);
     } else {
         serve_http(stream, udp_port, posted, faults);
     }
 }
 
-fn serve_websocket(stream: TcpStream, posted: &Sender<(Transport, State)>) {
+fn serve_websocket(stream: TcpStream, posted: &Sender<(Transport, State)>, faults: &Faults) {
     let Ok(mut socket) = tungstenite::accept(stream) else {
         return;
     };
     // WLED greets every client with its state and info.
     let _ = socket.send(Message::text(r#"{"state":{},"info":{}}"#));
     while let Ok(message) = socket.read() {
+        if let Message::Text(text) = &message
+            && text.as_str() == "p"
+        {
+            // WLED's heartbeat.
+            faults.heartbeats.fetch_add(1, Ordering::SeqCst);
+            let _ = socket.send(Message::text("pong"));
+            continue;
+        }
         if let Message::Text(json) = message {
             // JSON is a subset of YAML.
             let state = serde_yaml::from_str(json.as_str()).unwrap();

@@ -44,6 +44,10 @@ const SOCKET_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// How long to wait before telling a node again what it failed to take.
 const RESEND_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long a node is given to load a preset before it is told anything
+/// that the preset must not override.
+const PRESET_LOAD_TIME: Duration = Duration::from_millis(250);
+
 /// The crossfade WLED applies to each update, in units of 100 ms.
 ///
 /// WLED otherwise fades every change over its configured transition time,
@@ -355,8 +359,23 @@ struct Link {
     /// When to tell the node again what it may have missed. None while the
     /// node is up to date as far as we know.
     resend_at: Option<Instant>,
+    /// When a node that was sent back to its preset will have loaded it and
+    /// can be told the rest.
+    after_preset: Option<Instant>,
     /// Whether we have already said that the node is not answering.
     unreachable: bool,
+}
+
+/// What became of a state we tried to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    /// The node took it.
+    Reached,
+    /// The node took it over HTTP after its WebSocket failed. What went into
+    /// the socket before that may never have arrived.
+    ReachedAfterLosingSocket,
+    /// The node did not take it.
+    Missed,
 }
 
 impl Link {
@@ -368,71 +387,27 @@ impl Link {
             socket_missing: false,
             told: None,
             resend_at: None,
+            after_preset: None,
             unreachable: false,
         }
     }
 
     /// Send `state` over the WebSocket, or over HTTP if there is none.
     fn send(&mut self, state: State) {
-        let told = remember(self.told.take(), &state);
-        // A node that has missed something is brought up to date in one go.
-        let state = if self.resend_at.is_some() {
-            told.clone()
+        if state.ps.is_some() {
+            // A newly picked preset replaces one the node was being sent
+            // back to.
+            self.after_preset = None;
+        }
+        self.told = Some(remember(self.told.take(), &state));
+        if self.resend_at.is_some() {
+            // The node has missed something, so bring it fully up to date.
+            self.resync();
         } else {
-            state
-        };
-        self.told = Some(told);
-        self.transmit(state);
-    }
-
-    fn transmit(&mut self, mut state: State) {
-        self.open_socket();
-        if let Some(socket) = &mut self.socket {
-            match socket.send(&state) {
-                Ok(()) => {
-                    self.reached();
-                    return;
-                }
-                Err(err) => {
-                    warn!("WLED WebSocket to {} failed: {err:#}", self.wled.url);
-                    self.socket = None;
-                    // Whatever went into the socket lately may have been lost
-                    // along with it.
-                    if let Some(told) = &self.told {
-                        state = told.clone();
-                    }
-                }
-            }
+            let sent = self.transmit(state);
+            self.note(sent);
         }
-        self.wled.state = Some(state);
-        match self.wled.flush_state() {
-            Ok(response) if response.status().is_success() => self.reached(),
-            Ok(response) => self.missed(format_args!("the node answered {}", response.status())),
-            Err(err) => self.missed(format_args!("{err}")),
-        }
-    }
-
-    /// The node took what we sent.
-    fn reached(&mut self) {
-        if self.unreachable {
-            info!("WLED at {} is answering again.", self.wled.url);
-        }
-        self.unreachable = false;
-        self.resend_at = None;
-    }
-
-    /// The node did not take what we sent; try again later.
-    fn missed(&mut self, why: std::fmt::Arguments) {
-        if self.unreachable {
-            debug!("WLED at {} is still not answering: {why}", self.wled.url);
-        } else {
-            warn!(
-                "failed to send state to WLED at {}, will keep trying: {why}",
-                self.wled.url
-            );
-        }
-        self.unreachable = true;
-        self.resend_at = Some(Instant::now() + RESEND_INTERVAL);
+        self.finish_resync();
     }
 
     /// Look after the connection between sends: keep the socket open so that
@@ -448,11 +423,120 @@ impl Link {
             self.resend_at = Some(Instant::now());
         }
         if self.resend_at.is_some_and(|at| at <= Instant::now()) {
-            match self.told.clone() {
-                Some(told) => self.transmit(told),
-                None => self.resend_at = None,
+            self.resync();
+        }
+        self.finish_resync();
+    }
+
+    /// Tell the node everything it should be showing.
+    ///
+    /// WLED applies the other fields of a message before it loads the preset
+    /// the message names, and the preset then overrides them. So a node that
+    /// should be on a preset is sent the preset alone, and the rest once it
+    /// has had time to load it.
+    fn resync(&mut self) {
+        let Some(told) = self.told.clone() else {
+            self.resend_at = None;
+            return;
+        };
+        let has_preset = told.ps.is_some();
+        let first = if has_preset {
+            State {
+                ps: told.ps,
+                tt: told.tt,
+                ..Default::default()
+            }
+        } else {
+            told
+        };
+        if self.transmit(first) == Sent::Missed {
+            self.resend_at = Some(Instant::now() + RESEND_INTERVAL);
+            return;
+        }
+        self.resend_at = None;
+        self.after_preset = has_preset.then(|| Instant::now() + PRESET_LOAD_TIME);
+    }
+
+    /// Send what was held back for a preset to load, once it has.
+    fn finish_resync(&mut self) {
+        if self.after_preset.is_none_or(|at| at > Instant::now()) {
+            return;
+        }
+        self.after_preset = None;
+        let Some(mut rest) = self.told.clone() else {
+            return;
+        };
+        rest.ps = None;
+        let sent = self.transmit(rest);
+        self.note(sent);
+    }
+
+    /// Arrange to tell the node again whatever a send may have cost it.
+    fn note(&mut self, sent: Sent) {
+        match sent {
+            Sent::Reached => {}
+            Sent::ReachedAfterLosingSocket => self.resend_at = Some(Instant::now()),
+            Sent::Missed => self.resend_at = Some(Instant::now() + RESEND_INTERVAL),
+        }
+    }
+
+    fn transmit(&mut self, state: State) -> Sent {
+        self.open_socket();
+        let mut lost_socket = false;
+        if let Some(socket) = &mut self.socket {
+            match socket.send(&state) {
+                Ok(()) => {
+                    self.reached();
+                    return Sent::Reached;
+                }
+                Err(err) => {
+                    warn!("WLED WebSocket to {} failed: {err:#}", self.wled.url);
+                    self.socket = None;
+                    lost_socket = true;
+                }
             }
         }
+        self.wled.state = Some(state);
+        let failure = match self.wled.flush_state() {
+            Ok(response) if response.status().is_success() => None,
+            Ok(response) => Some(format!("the node answered {}", response.status())),
+            Err(err) => Some(err.to_string()),
+        };
+        match failure {
+            None => {
+                self.reached();
+                if lost_socket {
+                    Sent::ReachedAfterLosingSocket
+                } else {
+                    Sent::Reached
+                }
+            }
+            Some(why) => {
+                self.missed(&why);
+                Sent::Missed
+            }
+        }
+    }
+
+    /// The node took what we sent.
+    fn reached(&mut self) {
+        if self.unreachable {
+            info!("WLED at {} is answering again.", self.wled.url);
+        }
+        self.unreachable = false;
+    }
+
+    /// The node did not take what we sent.
+    fn missed(&mut self, why: &str) {
+        if self.unreachable {
+            debug!("WLED at {} is still not answering: {why}", self.wled.url);
+        } else {
+            warn!(
+                "failed to send state to WLED at {}, will keep trying: {why}",
+                self.wled.url
+            );
+        }
+        self.unreachable = true;
     }
 
     fn open_socket(&mut self) {
@@ -826,6 +910,47 @@ mod tests {
         let state = fake.next_state();
         assert_eq!(state.bri, Some(20));
         assert_eq!(state.seg.unwrap().remove(0).fx, Some(108));
+    }
+
+    /// A quiet socket is checked with WLED's heartbeat, which is what finds
+    /// a node that restarted while nothing was being sent.
+    #[test]
+    fn idle_socket_is_kept_alive_with_heartbeats() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        controller.send(WledControlMessage::SetState(level(10)));
+        assert_eq!(fake.next_posted().0, Transport::WebSocket);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fake.heartbeats() == 0 {
+            assert!(Instant::now() < deadline, "no heartbeat arrived");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// WLED loads a preset after applying the rest of the message that names
+    /// it, and the preset overrides them. A node sent back to a preset is
+    /// therefore told the preset first and the level afterwards.
+    #[test]
+    fn node_sent_back_to_a_preset_is_told_the_level_afterwards() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        controller.send(WledControlMessage::SetState(preset(3)));
+        assert_eq!(fake.next_state().ps, Some(3));
+        controller.send(WledControlMessage::SetState(level(20)));
+        assert_eq!(fake.next_state().bri, Some(20));
+
+        std::thread::sleep(Duration::from_millis(50));
+        fake.drop_websockets();
+
+        let first = fake.next_state();
+        assert_eq!(first.ps, Some(3));
+        assert_eq!(first.bri, None);
+        let asked_for_preset = Instant::now();
+        let second = fake.next_state();
+        assert_eq!(second.ps, None);
+        assert_eq!(second.bri, Some(20));
+        assert!(asked_for_preset.elapsed() >= PRESET_LOAD_TIME / 2);
     }
 
     /// Picking an effect replaces a preset's look, so a node brought up to

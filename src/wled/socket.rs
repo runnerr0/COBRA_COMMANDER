@@ -31,6 +31,9 @@ pub struct StateSocket {
 /// How long a socket may sit quiet before we ping the node.
 const PING_INTERVAL: Duration = Duration::from_secs(2);
 
+/// The text WLED takes as a heartbeat.
+const HEARTBEAT: &str = "p";
+
 /// The most messages from the node to discard in one go.
 const MAX_DRAINED_MESSAGES: usize = 64;
 
@@ -75,12 +78,13 @@ impl StateSocket {
     ///
     /// A node that restarts leaves no trace on a quiet connection. The ping
     /// draws a reset out of it, so the loss shows up here rather than on the
-    /// operator's next move.
+    /// operator's next move. WLED does not answer WebSocket ping frames; its
+    /// own heartbeat is a text message, which it answers with "pong".
     pub fn keep_alive(&mut self) -> Result<()> {
         if self.sent.elapsed() >= PING_INTERVAL {
             self.sent = Instant::now();
             self.socket
-                .send(Message::Ping(Default::default()))
+                .send(Message::text(HEARTBEAT))
                 .context("failed to ping the node")?;
         }
         self.drain()
