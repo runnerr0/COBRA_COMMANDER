@@ -384,6 +384,12 @@ mod tests {
         assert!(node.rgbw);
         assert_eq!(node.preset_count, Some(fake::PRESET_COUNT));
 
+        // Withdraw the advertisement, or the name lingers on the network
+        // for anything else that browses.
+        let withdrawn = advertiser
+            .unregister(&format!("{name}.{SERVICE_TYPE}"))
+            .unwrap();
+        let _ = withdrawn.recv_timeout(Duration::from_secs(2));
         advertiser.shutdown().unwrap();
     }
 }
