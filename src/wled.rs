@@ -1,20 +1,31 @@
 //! Use a thread to perform asynchronous communication with a WLED instance.
 use log::{debug, error, info, warn};
 use std::{
-    sync::{
-        Arc, Mutex,
-        mpsc::{Sender, channel},
-    },
+    sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
 
 use reqwest::Url;
 use wled_json_api_library::{structures::state::State, wled::Wled};
 
+use crate::worker::Shutdown;
+
+/// How long to wait between attempts to reach a WLED instance at startup.
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often an idle sender re-checks for shutdown.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The crossfade WLED applies to each update, in units of 100 ms.
+///
+/// WLED otherwise fades every change over its configured transition time,
+/// which makes a live control lag behind the hand moving it.
+const TRANSITION: u8 = 0;
+
 #[derive(Debug)]
 pub struct WledController {
     url: Url,
-    send: Sender<WledControlMessage>,
+    outbox: Arc<Outbox>,
 }
 
 impl WledController {
@@ -23,88 +34,146 @@ impl WledController {
     /// Polls once every 5 seconds for initial configuration until the client
     /// responds.
     pub fn run(url: Url) -> Self {
-        let (send_state, recv_state) = channel();
+        let outbox = Arc::new(Outbox::default());
 
-        let state = Arc::new(Mutex::new(None));
-        let state_clone = state.clone();
-        // Drain control channel using a thread into mutex.
-        crate::worker::spawn("wled-drain", move |_shutdown| {
-            for msg in recv_state {
-                let Ok(mut lock) = state_clone.lock() else {
-                    error!("Failed to get WLED state lock.");
-                    continue;
-                };
-                lock.replace(msg);
-            }
-            info!("WLED handler thread shutting down.");
-        });
-
-        let init_url = url.clone();
-        crate::worker::spawn("wled-poll", move |shutdown| {
-            let mut wled = initialize(&init_url, Duration::from_secs(5));
-            let sleep = Duration::from_millis(100);
-            loop {
-                if shutdown.sleep_or_shutdown(sleep) {
-                    return;
-                }
-                let msg = {
-                    let Ok(mut lock) = state.lock() else {
-                        error!("Failed to get WLED state lock.");
-                        continue;
-                    };
-                    let Some(state) = lock.take() else {
-                        continue;
-                    };
-                    state
-                };
-                match msg {
-                    WledControlMessage::SetState(state) => {
-                        wled.state = Some(state);
-                        debug!("Sending WLED state to {}.", init_url);
-                        if let Err(err) = wled.flush_state() {
-                            warn!("failed to send WLED state update: {err}");
-                            continue;
-                        }
-                    }
-                    WledControlMessage::GetEffectMetadata => {
-                        // TODO
-                        debug!("fxdata not implemented");
-                        continue;
-                    }
+        let sender_outbox = outbox.clone();
+        let sender_url = url.clone();
+        crate::worker::spawn("wled-send", move |shutdown| {
+            let Some(mut wled) = initialize(&sender_url, CONNECT_RETRY_INTERVAL, &shutdown) else {
+                return;
+            };
+            while let Some(state) = sender_outbox.take(&shutdown) {
+                wled.state = Some(state);
+                debug!("Sending WLED state to {sender_url}.");
+                if let Err(err) = wled.flush_state() {
+                    warn!("failed to send WLED state update: {err}");
                 }
             }
+            info!("WLED sender thread for {sender_url} shutting down.");
         });
-        Self {
-            send: send_state,
-            url,
-        }
+
+        Self { url, outbox }
     }
 
     /// Send a WLED control message.
     pub fn send(&self, msg: WledControlMessage) {
-        if self.send.send(msg).is_err() {
-            error!(
-                "WLED control channel hung up, unable to send message to {}.",
-                self.url
-            );
+        match msg {
+            WledControlMessage::SetState(mut state) => {
+                state.tt = Some(TRANSITION);
+                if !self.outbox.post(state) {
+                    error!(
+                        "WLED outbox is unusable, unable to send message to {}.",
+                        self.url
+                    );
+                }
+            }
+            WledControlMessage::GetEffectMetadata => {
+                // TODO
+                debug!("fxdata not implemented");
+            }
         }
     }
 }
 
+impl Drop for WledController {
+    fn drop(&mut self) {
+        self.outbox.close();
+    }
+}
+
+/// The state waiting to be sent to a WLED instance.
+///
+/// A request is in flight for much longer than the interval between control
+/// changes, so updates posted in the meantime collapse into one: the sender
+/// always transmits the newest state rather than working through a backlog.
+#[derive(Debug, Default)]
+struct Outbox {
+    pending: Mutex<Pending>,
+    wake: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct Pending {
+    state: Option<State>,
+    /// Set once the controller is dropped; the sender then stops.
+    closed: bool,
+}
+
+impl Outbox {
+    /// Queue a state for sending, superseding any state not yet sent.
+    ///
+    /// Return false if the outbox can no longer accept states.
+    fn post(&self, state: State) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        pending.state = Some(supersede(pending.state.take(), state));
+        self.wake.notify_one();
+        true
+    }
+
+    /// Stop the sender once it finishes any request in flight.
+    fn close(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.closed = true;
+        }
+        self.wake.notify_one();
+    }
+
+    /// Block until a state is posted and take it.
+    ///
+    /// Return None once the outbox is closed or shutdown is triggered.
+    fn take(&self, shutdown: &Shutdown) -> Option<State> {
+        let mut pending = self.pending.lock().ok()?;
+        loop {
+            if pending.closed || shutdown.triggered() {
+                return None;
+            }
+            if let Some(state) = pending.state.take() {
+                return Some(state);
+            }
+            (pending, _) = self
+                .wake
+                .wait_timeout(pending, SHUTDOWN_POLL_INTERVAL)
+                .ok()?;
+        }
+    }
+}
+
+/// Fold an unsent state into the newer one that replaces it.
+///
+/// The newer state wins wherever it sets a field. A field it leaves unset
+/// keeps the unsent value, so an update to one control (a preset selection,
+/// say) does not discard a different control's change still waiting to go out.
+fn supersede(unsent: Option<State>, mut newer: State) -> State {
+    let Some(unsent) = unsent else {
+        return newer;
+    };
+    newer.on = newer.on.or(unsent.on);
+    newer.bri = newer.bri.or(unsent.bri);
+    newer.ps = newer.ps.or(unsent.ps);
+    newer.seg = newer.seg.or(unsent.seg);
+    newer
+}
+
 /// Poll the WLED API until we get a good config back.
-fn initialize(url: &Url, poll_interval: Duration) -> Wled {
+///
+/// Return None if shutdown is triggered first.
+fn initialize(url: &Url, poll_interval: Duration, shutdown: &Shutdown) -> Option<Wled> {
     info!("Initializing WLED for {url}...");
     loop {
         match Wled::try_from_url(url) {
             Ok(wled) => {
                 info!("WLED client connection successful.");
-                return wled;
+                return Some(wled);
             }
             Err(err) => {
                 warn!("Failed to initialize WLED at {url}: {err}");
             }
         }
-        std::thread::sleep(poll_interval);
+        if shutdown.sleep_or_shutdown(poll_interval) {
+            return None;
+        }
     }
 }
 
@@ -112,4 +181,165 @@ pub enum WledControlMessage {
     SetState(State),
     #[allow(unused)]
     GetEffectMetadata,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::mpsc::{Receiver, Sender, channel},
+    };
+
+    use super::*;
+
+    /// A stand-in for a WLED node: accepts every request with 200 and reports
+    /// the bodies posted to `/json/state`.
+    struct FakeWled {
+        url: Url,
+        posted: Receiver<State>,
+    }
+
+    impl FakeWled {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+            let (send, posted) = channel();
+            // Serves until the test process exits.
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    serve(stream, &send);
+                }
+            });
+            Self { url, posted }
+        }
+
+        /// The next state posted, failing the test if none arrives.
+        fn next_state(&self) -> State {
+            self.posted.recv_timeout(Duration::from_secs(5)).unwrap()
+        }
+    }
+
+    /// Answer one request, closing the connection afterwards.
+    fn serve(stream: TcpStream, posted: &Sender<State>) {
+        let mut reader = BufReader::new(&stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        let mut body_len = 0;
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).unwrap();
+            if header.trim().is_empty() {
+                break;
+            }
+            if let Some((name, value)) = header.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                body_len = value.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; body_len];
+        reader.read_exact(&mut body).unwrap();
+        if request_line.starts_with("POST /json/state") {
+            // JSON is a subset of YAML.
+            let _ = posted.send(serde_yaml::from_slice(&body).unwrap());
+        }
+        (&stream)
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .unwrap();
+    }
+
+    #[test]
+    fn controller_posts_state_without_a_transition() {
+        let fake = FakeWled::start();
+        let controller = WledController::run(fake.url.clone());
+        controller.send(WledControlMessage::SetState(level(10)));
+
+        let state = fake.next_state();
+        assert_eq!(state.bri, Some(10));
+        assert_eq!(state.tt, Some(TRANSITION));
+    }
+
+    fn level(bri: u8) -> State {
+        State {
+            bri: Some(bri),
+            ..Default::default()
+        }
+    }
+
+    fn preset(ps: i32) -> State {
+        State {
+            ps: Some(ps),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn take_returns_only_the_newest_state() {
+        let outbox = Outbox::default();
+        assert!(outbox.post(level(10)));
+        assert!(outbox.post(level(20)));
+
+        let state = outbox.take(&Shutdown::default()).unwrap();
+        assert_eq!(state.bri, Some(20));
+    }
+
+    /// A preset selected just before a fader moves must still reach WLED.
+    #[test]
+    fn unsent_preset_survives_a_newer_state() {
+        let outbox = Outbox::default();
+        assert!(outbox.post(preset(3)));
+        assert!(outbox.post(level(20)));
+
+        let state = outbox.take(&Shutdown::default()).unwrap();
+        assert_eq!(state.ps, Some(3));
+        assert_eq!(state.bri, Some(20));
+    }
+
+    /// A fader moved just before a preset is selected must still reach WLED.
+    #[test]
+    fn unsent_level_survives_a_newer_preset() {
+        let state = supersede(Some(level(20)), preset(3));
+        assert_eq!(state.ps, Some(3));
+        assert_eq!(state.bri, Some(20));
+    }
+
+    #[test]
+    fn newer_preset_replaces_an_unsent_preset() {
+        let state = supersede(Some(preset(3)), preset(4));
+        assert_eq!(state.ps, Some(4));
+    }
+
+    #[test]
+    fn sent_preset_is_not_repeated() {
+        let outbox = Outbox::default();
+        let shutdown = Shutdown::default();
+        assert!(outbox.post(preset(3)));
+        assert_eq!(outbox.take(&shutdown).unwrap().ps, Some(3));
+
+        assert!(outbox.post(level(20)));
+        assert_eq!(outbox.take(&shutdown).unwrap().ps, None);
+    }
+
+    #[test]
+    fn take_wakes_for_a_state_posted_while_waiting() {
+        let outbox = Arc::new(Outbox::default());
+        let waiter = {
+            let outbox = outbox.clone();
+            std::thread::spawn(move || outbox.take(&Shutdown::default()))
+        };
+        assert!(outbox.post(level(10)));
+
+        let state = waiter.join().unwrap().unwrap();
+        assert_eq!(state.bri, Some(10));
+    }
+
+    #[test]
+    fn take_returns_none_once_closed() {
+        let outbox = Outbox::default();
+        assert!(outbox.post(level(10)));
+        outbox.close();
+
+        assert!(outbox.take(&Shutdown::default()).is_none());
+    }
 }
