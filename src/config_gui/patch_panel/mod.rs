@@ -2008,6 +2008,7 @@ mod test {
             port: 80,
             udp_port: DEFAULT_UDP_PORT,
             led_count: Some(300),
+            preset_count: Some(7),
         }]));
         let mut form = AddGroupForm::new();
         form.sync_options(&patchers);
@@ -2028,7 +2029,9 @@ mod test {
         harness.run();
         harness.get_by_label("Discovered").click();
         harness.run();
-        harness.get_by_label("wled-kitchen (10.0.0.7)").click();
+        harness
+            .get_by_label("wled-kitchen (10.0.0.7), 300 LEDs, 7 presets")
+            .click();
         harness.run();
         drop(harness);
 

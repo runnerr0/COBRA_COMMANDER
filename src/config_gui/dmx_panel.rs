@@ -375,6 +375,7 @@ mod test {
                 port: 80,
                 udp_port: DEFAULT_UDP_PORT,
                 led_count: Some(300),
+                preset_count: None,
             }]),
         ));
         let debug_open = debug_open();

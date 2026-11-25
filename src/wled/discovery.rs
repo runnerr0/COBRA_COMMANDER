@@ -36,6 +36,9 @@ pub struct WledNode {
     pub udp_port: u16,
     /// How many LEDs the node drives, if it has told us.
     pub led_count: Option<u16>,
+    /// The highest-numbered preset saved on the node, if it has told us.
+    /// This is the preset count to patch a WLED group with.
+    pub preset_count: Option<u8>,
 }
 
 impl WledNode {
@@ -53,7 +56,20 @@ impl WledNode {
             port: service.port,
             udp_port: DEFAULT_UDP_PORT,
             led_count: None,
+            preset_count: None,
         })
+    }
+
+    /// A one-line summary for a list of nodes to pick from.
+    pub fn summary(&self) -> String {
+        let mut summary = format!("{} ({})", self.name, self.address);
+        if let Some(led_count) = self.led_count {
+            summary.push_str(&format!(", {led_count} LEDs"));
+        }
+        if let Some(preset_count) = self.preset_count {
+            summary.push_str(&format!(", {preset_count} presets"));
+        }
+        summary
     }
 
     /// Ask the node for the details mDNS does not carry.
@@ -63,19 +79,45 @@ impl WledNode {
         let Some(url) = self.url() else {
             return;
         };
-        let info = Wled::try_from_url(&url).and_then(|mut wled| {
-            wled.get_info_from_wled()?;
-            Ok(wled.info)
-        });
-        match info {
-            Ok(Some(info)) => {
-                self.udp_port = info.udpport.unwrap_or(self.udp_port);
-                self.led_count = info.leds.and_then(|leds| leds.count);
+        let mut wled = match Wled::try_from_url(&url) {
+            Ok(wled) => wled,
+            Err(err) => {
+                debug!("WLED node {} did not answer: {err}", self.name);
+                return;
             }
-            Ok(None) => {}
+        };
+        match wled.get_info_from_wled() {
+            Ok(()) => {
+                if let Some(info) = wled.info.take() {
+                    self.udp_port = info.udpport.unwrap_or(self.udp_port);
+                    self.led_count = info.leds.and_then(|leds| leds.count);
+                }
+            }
             Err(err) => debug!("WLED node {} did not describe itself: {err}", self.name),
         }
+        self.preset_count = url
+            .join("presets.json")
+            .ok()
+            .and_then(|presets| wled.client.get(presets).send().ok())
+            .and_then(|response| response.text().ok())
+            .and_then(|presets| highest_preset_id(&presets));
     }
+}
+
+/// The highest ID among the presets in the contents of a node's
+/// `presets.json`.
+///
+/// The file maps preset IDs to presets. WLED keeps an empty entry at ID 0,
+/// which is not a preset.
+fn highest_preset_id(presets: &str) -> Option<u8> {
+    // JSON is a subset of YAML.
+    let presets: BTreeMap<String, serde_yaml::Value> = serde_yaml::from_str(presets).ok()?;
+    presets
+        .iter()
+        .filter(|(_, preset)| preset.as_mapping().is_some_and(|preset| !preset.is_empty()))
+        .filter_map(|(id, _)| id.parse::<u8>().ok())
+        .filter(|id| *id > 0)
+        .max()
 }
 
 /// The instance part of an mDNS service's full name.
@@ -254,8 +296,41 @@ mod tests {
             port: 80,
             udp_port: DEFAULT_UDP_PORT,
             led_count: None,
+            preset_count: None,
         };
         assert_eq!(node.url().unwrap().as_str(), "http://10.0.0.7/");
+    }
+
+    #[test]
+    fn summary_includes_what_the_node_has_reported() {
+        let mut node = WledNode {
+            name: "wled-kitchen".to_string(),
+            address: Ipv4Addr::new(10, 0, 0, 7),
+            port: 80,
+            udp_port: DEFAULT_UDP_PORT,
+            led_count: None,
+            preset_count: None,
+        };
+        assert_eq!(node.summary(), "wled-kitchen (10.0.0.7)");
+
+        node.led_count = Some(300);
+        node.preset_count = Some(7);
+        assert_eq!(
+            node.summary(),
+            "wled-kitchen (10.0.0.7), 300 LEDs, 7 presets"
+        );
+    }
+
+    #[test]
+    fn highest_preset_id_skips_the_empty_entry_and_gaps() {
+        let presets = r#"{"0":{},"1":{"n":"Warm","on":true},"3":{"n":"Chase","bri":128}}"#;
+        assert_eq!(highest_preset_id(presets), Some(3));
+    }
+
+    #[test]
+    fn node_with_no_presets_has_no_highest_id() {
+        assert_eq!(highest_preset_id(r#"{"0":{}}"#), None);
+        assert_eq!(highest_preset_id("not json"), None);
     }
 
     /// Advertise a node the way WLED does, find it by browsing, and learn
@@ -289,6 +364,7 @@ mod tests {
         assert_eq!(node.port, fake.port);
         assert_eq!(node.udp_port, fake.udp_port);
         assert_eq!(node.led_count, Some(fake::LED_COUNT));
+        assert_eq!(node.preset_count, Some(fake::PRESET_COUNT));
 
         advertiser.shutdown().unwrap();
     }

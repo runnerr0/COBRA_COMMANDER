@@ -134,10 +134,7 @@ pub fn render_option_widget(
                         let Some(url) = node.url() else {
                             continue;
                         };
-                        if ui
-                            .button(format!("{} ({})", node.name, node.address))
-                            .clicked()
-                        {
+                        if ui.button(node.summary()).clicked() {
                             *value = url.to_string();
                             ui.close();
                         }

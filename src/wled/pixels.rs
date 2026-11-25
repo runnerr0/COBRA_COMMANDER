@@ -302,6 +302,7 @@ mod tests {
             port: 80,
             udp_port: socket.local_addr().unwrap().port(),
             led_count,
+            preset_count: None,
         };
         (socket, node)
     }
@@ -319,6 +320,7 @@ mod tests {
             port: 80,
             udp_port: DEFAULT_UDP_PORT,
             led_count,
+            preset_count: None,
         }
     }
 

@@ -13,6 +13,9 @@ use wled_json_api_library::structures::state::State;
 /// The LED count the fake reports.
 pub const LED_COUNT: u16 = 300;
 
+/// The highest ID among the presets the fake reports.
+pub const PRESET_COUNT: u8 = 3;
+
 /// How a state reached the fake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -141,6 +144,9 @@ fn serve_http(stream: TcpStream, udp_port: u16, posted: &Sender<(Transport, Stat
         let info =
             format!(r#"{{"ver":"0.15.0","leds":{{"count":{LED_COUNT}}},"udpport":{udp_port}}}"#);
         ("200 OK", info)
+    } else if request_line.starts_with("GET /presets.json") {
+        let presets = r#"{"0":{},"1":{"n":"Warm"},"3":{"n":"Chase"}}"#;
+        ("200 OK", presets.to_string())
     } else if request_line.starts_with("GET /ws") {
         ("404 Not Found", String::new())
     } else {
